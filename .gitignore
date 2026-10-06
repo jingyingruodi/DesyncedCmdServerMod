@@ -1,0 +1,31 @@
+# 忽略游戏引用文件
+Desynced Lua API.html
+Modding - Desynced Wiki.html
+Modding - Desynced Wiki_files/
+TextChat_reference.lua
+ChatGPT5.3给出的一点Desynced模组开发想法.html
+ChatGPT5.3给出的一点Desynced模组开发想法_files/
+# 忽略主体源代码提取目录（仅本地参考）
+main_extracted/
+main_server_extracted/
+
+# 日志文件
+日志.log
+*.log
+与开发者聊天的重要消息.txt
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# 项目特定内容
+InsectLimit/
+CmdServerMod.zip
