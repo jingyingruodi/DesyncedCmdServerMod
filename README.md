@@ -47,25 +47,38 @@ password-protected rank system with admin commands.
 
 Ranks: `guest < player < admin < superadmin`.
 
-### Becoming the first superadmin
-
-Either pass the setup key on the server command line (**recommended** — it is then
-never printed anywhere):
+Put the key in **GameSettings** (recommended — it is then never printed anywhere):
 
 ```
-DesyncedServer.exe save.desynced … -SetupKey=<your-key>
+DesyncedServer.exe save.desynced … -GameSettings="{ ..., 'CmdServerMod_setupkey': '<your-key>' }"
 ```
 
 then `/register <pw> <pw> <your-key>` in game.
 
 Or let the mod generate one; it is printed once to the server console.
-⚠️ That console line is mirrored to every client's debug log, so register the
-first superadmin immediately (or use `-SetupKey=`).
+⚠️ That console line is mirrored to **every client's** debug log, so register the
+first superadmin immediately and then run `/setupkey regen`.
+
+> ⚠️ **`-SetupKey=<key>` on the command line does NOT work.** `Game.GetCommandLineArguments()`
+> is a UI-only API and throws when called from the Simulation layer (verified on a live
+> dedicated server, 2026-10-07). Use GameSettings instead. Same for `-CmdServerMod_Diag` —
+> use `'CmdServerMod_diag': '1'` in GameSettings.
 
 ### Server launch flags
 
 - ✅ `-logsteam -moddev -log`
 - ❌ **Do not use `-NOSTEAM`** — on Wine/Proton it makes the server hang silently.
+
+### Log visibility (verified live, 2026-10-07)
+
+`print()` from the Simulation layer is mirrored to **every connected client's debug
+log** — players who open the in-game debug console can read all command inputs and
+results. The private *chat* reply is not affected (that goes point-to-point through
+`Action.RunUI`), and genuinely confidential output (`/account export`,
+`/setupkey show|regen`) never goes through `print` at all.
+
+If you do not want ordinary command input/output to be visible to players, set
+`LOG_COMMANDS` / `LOG_RESULTS` / `LOG_CHAT` to `false` near the top of `data/main.lua`.
 
 ### Known limitations
 
@@ -120,21 +133,35 @@ first superadmin immediately (or use `-SetupKey=`).
 
 ### 成为第一个超管
 
-推荐在服务端命令行直接指定密钥（此路径下**密钥绝不会被打印**）：
+推荐把密钥写进 **GameSettings**（此路径下**密钥绝不会被打印**）：
 
 ```
-DesyncedServer.exe save.desynced … -SetupKey=<你的密钥>
+DesyncedServer.exe save.desynced … -GameSettings="{ ... , 'CmdServerMod_setupkey': '你的密钥' }"
 ```
 
 然后游戏内 `/register <密码> <密码> <你的密钥>`。
 
 不加参数时模组会随机生成一个并打印到服务端控制台一次 ——
-⚠️ 那一行会同步到所有客户端调试日志，请注册完第一个超管后改用 `-SetupKey=`。
+⚠️ 那一行会同步到**所有客户端**调试日志，请注册完第一个超管后立刻执行 `/setupkey regen`。
+
+> ⚠️ **命令行的 `-SetupKey=<密钥>` 是无效的**：`Game.GetCommandLineArguments()` 是
+> UI 层专属 API，在 Simulation 层调用会抛错（2026-10-07 真实专用服务器实测）。
+> 请改用 GameSettings。命令行开关 `-CmdServerMod_Diag` 同理，应写成
+> `'CmdServerMod_diag': '1'`。
 
 ### 服务器启动参数
 
 - ✅ `-logsteam -moddev -log`
 - ❌ **不要用 `-NOSTEAM`** —— 在 Wine/Proton 下会让服务器静默挂住（实测）。
+
+### 日志可见性（2026-10-07 真实联机实测）
+
+Simulation 层的 `print()` 会同步到**所有在线客户端的调试日志** —— 玩家打开游戏内调试台
+就能看到彼此的指令输入与输出。**聊天栏里的私密回复不受影响**（那部分走 `Action.RunUI`
+点对点投递），真正机密的内容（`/account export`、`/setupkey show|regen`）也从不经过 `print`。
+
+如果你不希望普通指令的输入/输出被玩家看到，把 `data/main.lua` 顶部的
+`LOG_COMMANDS` / `LOG_RESULTS` / `LOG_CHAT` 改成 `false`。
 
 ### 已知限制
 

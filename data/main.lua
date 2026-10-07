@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.6"
+local version = "1.9.7"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -55,14 +55,23 @@ end
 -- 只能通过 Action.RunUI 私聊给发起者。（Simulation 层 print 会同步到所有客户端日志）
 local SECRET = {}
 
--- 从服务器命令行读取 -SetupKey=xxx
--- 这是唯一「不泄露」的 setup key 注入方式：命令行只有服务器运维能看到。
-local function setup_key_from_cmdline()
-    local ok, args = pcall(function() return Game.GetCommandLineArguments() end)
-    if not ok or type(args) ~= "string" then return nil end
-    local v = args:match("%-SetupKey=([%w_%-]+)") or args:match("%-setupkey=([%w_%-]+)")
-    if v and #v >= 4 then return v end
-    return nil
+-- 从 GameSettings（服务器命令行 -GameSettings="{...}"）读一个字符串配置项。
+--
+-- ⚠️ 为什么不用 Game.GetCommandLineArguments()：
+--    它是 **UI 层专属** API。在 Simulation 层调用会抛
+--      "This functionality can only be used in UI code, it is not available inside the simulation"
+--    （2026-10-07 在真实专用服务器上实测确认，控制台有 traceback）。
+--    而 Map.GetSettings() 在 Simulation 层可读，所以运维配置一律走 -GameSettings。
+--
+-- 运维用法（无泄露，密钥不会被打印）：
+--   -GameSettings="{ ... , 'CmdServerMod_setupkey': '你的密钥' }"
+local function setting_str(key, min_len)
+    local ok, ms = pcall(function() return Map.GetSettings() end)
+    if not ok or type(ms) ~= "table" then return nil end
+    local ok2, v = pcall(function() return ms[key] end)
+    if not ok2 or type(v) ~= "string" or v == "" then return nil end
+    if min_len and #v < min_len then return nil end
+    return v
 end
 
 srv_print("CmdServerMod", "Data Layer Booting v" .. version)
@@ -185,6 +194,18 @@ local function ensure_session(p_id, p_name)
     end
 end
 
+---------------------------------------------------------------------------
+-- 服务端审计日志开关
+---------------------------------------------------------------------------
+-- ⚠️ 2026-10-07 在真实联机中实测确认：Simulation 层的 print() 会同步到**所有客户端**
+--    的调试日志 —— 玩家在游戏内打开调试台就能看到彼此的指令输入与输出
+--    （但**看不到**聊天栏里的私密回复，那部分是走 Action.RunUI 点对点投递的）。
+-- 真正机密的内容（/account export、/setupkey show、/setupkey regen）一律走 SECRET 路径，
+-- 从不经过这里。下面三个开关只影响「普通」审计播报，介意被玩家看到就关掉。
+local LOG_CHAT     = true   -- 播报玩家聊天
+local LOG_COMMANDS = true   -- 播报指令输入（密码类已脱敏）
+local LOG_RESULTS  = true   -- 播报指令结果（SECRET 类永远不走这里）
+
 -- 模拟速率：游戏本体 data/instructions.lua 里写明 "5 simulation ticks per second"
 local TICKS_PER_SECOND = 5
 
@@ -268,10 +289,24 @@ end
 --   * 服务器命令行带 -CmdServerMod_Diag  → 首个 OnTick 自动打印一次
 --   * 游戏内 /diag（仅超管）
 -- 服务器命令行（**脱敏**：命令行里可能带 -SetupKey=<密钥>）
-local function cmdline_sanitized()
-    local ok, a = pcall(function() return Game.GetCommandLineArguments() end)
-    if not ok or type(a) ~= "string" then return "(unavailable)" end
-    return (a:gsub("[%-/][Ss]etup[Kk]ey=%S+", "-SetupKey=***"))
+-- 服务器命令行在 Simulation 层读不到（Game.GetCommandLineArguments 是 UI 专属）。
+-- 这里返回一句说明 + 模组实际能读到的配置，避免给出错误信息。
+local function cmdline_report()
+    local lines = {
+        "Simulation 层无法读取服务器命令行：",
+        "  Game.GetCommandLineArguments() 是 UI 层专属 API，在 Data 层会抛错。",
+        "运维配置请改走 -GameSettings，例如：",
+        "  -GameSettings=\"{ ... , 'CmdServerMod_setupkey': '你的密钥' }\"",
+        "",
+        "模组当前从 GameSettings 读到的键：",
+    }
+    local k = setting_str("CmdServerMod_setupkey", 4)
+    lines[#lines + 1] = "  CmdServerMod_setupkey : " ..
+        (k and ("已设置（" .. #k .. " 字符，值不外显）") or "未设置")
+    local imp = setting_str("CmdServerMod_import", 11)
+    lines[#lines + 1] = "  CmdServerMod_import  : " ..
+        (imp and ("已设置（" .. #imp .. " 字符）") or "未设置")
+    return table.concat(lines, "\n")
 end
 
 local function collect_diag()
@@ -287,8 +322,8 @@ local function collect_diag()
     add("dedicated", function() return select(2, Game.GetMultiplayerSession()) end)
     add("speed", function() return Map.GetGameSpeed() end)
     add("players", function() return #Game.GetAllPlayers() end)
-    -- ★ 必须脱敏：命令行里可能带 -SetupKey=<密钥>，而诊断输出会进服务端控制台
-    add("args", cmdline_sanitized)
+    -- 命令行在 Simulation 层读不到（UI 专属 API），不再尝试 —— 否则每次都刷 traceback
+    add("setupkey_set", function() return setting_str("CmdServerMod_setupkey", 4) ~= nil end)
 
     -- 存档结构：只列键名与类型
     local ok, save = pcall(function() return Map.GetSave() end)
@@ -326,9 +361,9 @@ local function collect_diag()
 end
 _G.CmdServerMod._collect_diag = collect_diag
 
+-- 是否要求开机自动打印一次诊断：GameSettings 里给 CmdServerMod_diag = "1" 即可
 local function diag_requested()
-    local ok, args = pcall(function() return Game.GetCommandLineArguments() end)
-    return ok and type(args) == "string" and args:find("CmdServerMod_Diag", 1, true) ~= nil
+    return setting_str("CmdServerMod_diag", 1) ~= nil
 end
 
 -- 现场调试开关：true 时，每个服务器进程在首个 tick 自动打印一次 collect_diag()。
@@ -353,10 +388,10 @@ local function ensure_init()
         local ms = get_ms()
 
         if ms.setup_key == "" then
-            local from_cmd = setup_key_from_cmdline()
-            if from_cmd then
-                ms.setup_key = from_cmd
-                srv_print("SYSTEM", "Setup key loaded from command line (-SetupKey). It is never printed.")
+            local from_cfg = setting_str("CmdServerMod_setupkey", 4)
+            if from_cfg then
+                ms.setup_key = from_cfg
+                srv_print("SYSTEM", "Setup key loaded from GameSettings (CmdServerMod_setupkey). It is never printed.")
             else
                 ms.setup_key = random_str(12)
                 -- ⚠️ 下面这一行会同步到所有客户端调试日志。这是 bootstrap 的固有代价：
@@ -861,11 +896,9 @@ _G.CmdServerMod.execute_command = function(text, p_id)
     elseif cmd == "cmdline" then
         -- 交接包里列出的诊断指令之一（会话里出现过），v1.8.0 未实现
         if not rank_at_least(p_id, "superadmin") then return true, "Access denied." end
-        local text = "Server command line:\n" .. cmdline_sanitized()
-        pcall(function()
-            srv_print("CMDLINE", "requested by P" .. tostring(p_id) .. " | " .. cmdline_sanitized())
-        end)
-        return true, text
+        -- 交接包的原始需求里列了 /cmdline；但命令行在 Simulation 层读不到，
+        -- 所以这里改为报告「模组实际能读到的运维配置」，并说明原因。
+        return true, cmdline_report()
 
     elseif cmd == "diag" then
         -- 运行期诊断：确认引擎行为（存档表语义、净模式、tick 等）。
@@ -1001,9 +1034,13 @@ function PlayerAction.CmdServerExec(player_id, faction, arg)
     local text = tostring(arg.txt or "")
 
     if arg.is_command then
-        srv_print("COMMAND", string.format("<%s>(P%d): %s", pname, rpid, sanitize_command(text)))
+        if LOG_COMMANDS then
+            srv_print("COMMAND", string.format("<%s>(P%d): %s", pname, rpid, sanitize_command(text)))
+        end
     else
-        srv_print("CHAT", string.format("<%s>(P%d): %s", pname, rpid, text))
+        if LOG_CHAT then
+            srv_print("CHAT", string.format("<%s>(P%d): %s", pname, rpid, text))
+        end
     end
 
     if arg.is_command and _G.CmdServerMod.execute_command then
@@ -1024,7 +1061,7 @@ function PlayerAction.CmdServerExec(player_id, faction, arg)
 
             -- ★ 机密结果绝不进入 print（print 会同步到所有客户端调试日志）。
             -- 私密反馈仍然走 Action.RunUI —— 它只在发起该 action 的那个玩家的 UI 上下文执行。
-            if secret ~= SECRET then
+            if secret ~= SECRET and LOG_RESULTS then
                 srv_print("RESULT", "To P" .. rpid .. ": " .. tostring(result))
             end
             pcall(function()
