@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.0"
+local version = "1.9.1"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -106,7 +106,9 @@ end
 local function get_session_rank(p_id)
     local sess = get_session(p_id)
     if not sess or not sess.logged_in then return "guest" end
-    local acct = get_account(sess.name)
+    -- 用「登录成功时认证过的账号名」，而不是当前显示名 ——
+    -- 否则玩家改名后权限会跟着漂移
+    local acct = get_account(sess.acct_name or sess.name)
     if not acct then return "guest" end
     return acct.rank or "guest"
 end
@@ -121,29 +123,54 @@ end
 _G.CmdServerMod._sessions = _G.CmdServerMod._sessions or {}
 
 local function init_session(p_id, p_name)
-    if _G.CmdServerMod._sessions[p_id] and _G.CmdServerMod._sessions[p_id].name == p_name then
-        -- 同一玩家重连：保留登录状态，仅刷新 last_seen
-        _G.CmdServerMod._sessions[p_id].last_seen = Map.GetTick()
+    local sess = _G.CmdServerMod._sessions[p_id]
+    if sess and sess.name == p_name then
+        sess.last_seen = Map.GetTick()
+    else
+        sess = { name = p_name, acct_name = nil, logged_in = false, last_seen = Map.GetTick() }
+        _G.CmdServerMod._sessions[p_id] = sess
+    end
+    if sess.logged_in then return end
+
+    local acct = get_account(p_name)
+    if not acct then return end
+
+    if acct.auto_logged_out then
+        -- 曾被自动登出，需手动 /login
+        sess._notify_relogin = true
+        srv_print("LOGIN", string.format("%s (P%d) was auto-logged out, manual /login required", p_name, p_id))
         return
     end
-    _G.CmdServerMod._sessions[p_id] = {
-        name = p_name,
-        logged_in = false,
-        last_seen = Map.GetTick(),
-    }
-    local acct = get_account(p_name)
-    if acct then
-        if acct.auto_logged_out then
-            -- 曾被自动登出，需手动 /login，通过 Action.RunUI 通知玩家
-            _G.CmdServerMod._sessions[p_id].logged_in = false
-            _G.CmdServerMod._sessions[p_id]._notify_relogin = true
-            srv_print("LOGIN", string.format("%s (P%d) was auto-logged out, manual /login required", p_name, p_id))
-        else
-            _G.CmdServerMod._sessions[p_id].logged_in = true
-            srv_print("LOGIN", string.format("%s (P%d) auto-logged as [%s]", p_name, p_id, acct.rank or "player"))
-        end
+
+    -- ★ 自动登录必须同时满足「账号存在」**和**「账号绑定的 player id 与当前一致」。
+    -- 只看名字是严重的认证漏洞：任何玩家只要把自己改名成别人的名字，
+    -- 就会在 init_session 里被自动登录成对方（无需密码）。
+    if acct.bound_player_id ~= p_id then
+        srv_print("LOGIN", string.format(
+            "%s (P%d) 未自动登录：账号已绑定到另一个 player id，需手动 /login", p_name, p_id))
+        sess._notify_relogin = true
+        return
     end
+
+    if not AUTO_LOGIN then
+        -- 默认路径：即使名字和 player id 都对上了，也要求手动 /login
+        sess._notify_relogin = true
+        srv_print("LOGIN", string.format("%s (P%d) 已注册账号，等待手动 /login", p_name, p_id))
+        return
+    end
+
+    sess.logged_in = true
+    sess.acct_name = p_name
+    srv_print("LOGIN", string.format("%s (P%d) auto-logged as [%s]", p_name, p_id, acct.rank or "player"))
 end
+
+-- 已认证的账号名（改名不改变已登录身份）
+local function my_account_name(p_id, p_name)
+    local sess = get_session(p_id)
+    if sess and sess.logged_in and sess.acct_name then return sess.acct_name end
+    return p_name
+end
+_G.CmdServerMod._my_account_name = my_account_name
 
 local function touch_session(p_id)
     if _G.CmdServerMod._sessions[p_id] then
@@ -158,8 +185,24 @@ local function ensure_session(p_id, p_name)
     end
 end
 
--- 自动登出：超过 N ticks 未活跃则登出
-local AUTO_LOGOUT_TICKS = 150  -- 30秒 (5 TPS * 30)
+-- 模拟速率：游戏本体 data/instructions.lua 里写明 "5 simulation ticks per second"
+local TICKS_PER_SECOND = 5
+
+-- ★ 自动登录开关（默认关闭，且**不建议**在没有稳定身份前打开）
+-- 原因：Desynced 没有向模组暴露 SteamID 之类的稳定身份。可用的只有
+--   (a) 玩家显示名 —— 谁都能改名冒充；
+--   (b) player.id  —— 会被回收再利用。
+-- 现有 API 里 player 对象只有 id / name / faction_id / ready / is_local / is_host，
+-- 所以「自动登录」在当前版本下**无法做到安全**。默认强制每次连接 /login。
+-- 将来若引擎暴露了稳定账号标识，把这个开关打开并改用该标识即可。
+local AUTO_LOGIN = false
+
+-- 各种周期（原来的 5 / 150 / 300 / 600 都是从这个 5 推出来的魔数）
+local PRESENCE_CHECK_TICKS = TICKS_PER_SECOND          -- 每秒检查一次在线状态
+local AUTO_LOGOUT_TICKS    = 30 * TICKS_PER_SECOND     -- 离线 30 秒自动登出
+local SESSION_GC_TICKS     = 120 * TICKS_PER_SECOND    -- 登出且离线 2 分钟后回收 session
+local HEARTBEAT_TICKS      = 60 * TICKS_PER_SECOND     -- 每 60 秒心跳
+-- 注意：若将来引擎改了这个速率，这里要同步改（已列为待实测项）
 
 ---------------------------------------------------------------------------
 -- 3. 安全导出：仅输出到服务端后台控制台
@@ -294,8 +337,15 @@ local function cmd_register(p_id, p_name, parts)
         srv_print("SYSTEM", "SuperAdmin registered via setup key: " .. p_name)
     end
 
-    set_account(p_name, { hash = hash_password(pw), rank = rank, created = Map.GetTick() })
-    _G.CmdServerMod._sessions[p_id].logged_in = true
+    set_account(p_name, {
+        hash = hash_password(pw), rank = rank, created = Map.GetTick(),
+        bound_player_id = p_id,   -- 自动登录的身份锚点（见 init_session）
+    })
+    local sess = _G.CmdServerMod._sessions[p_id]
+    if sess then
+        sess.logged_in = true
+        sess.acct_name = p_name
+    end
     touch_session(p_id)
     return "Registered! Name: " .. p_name .. " | Rank: " .. rank
 end
@@ -305,8 +355,14 @@ local function cmd_login(p_id, p_name, parts)
     local acct = get_account(p_name)
     if not acct then return "Account not found. Use /register." end
     if acct.hash ~= hash_password(parts[2]) then return "Incorrect password." end
-    _G.CmdServerMod._sessions[p_id].logged_in = true
-    acct.auto_logged_out = false  -- 手动登录成功，清除自动登出标记
+    local sess = _G.CmdServerMod._sessions[p_id]
+    if sess then
+        sess.logged_in = true
+        sess.acct_name = p_name
+    end
+    acct.auto_logged_out = false            -- 手动登录成功，清除自动登出标记
+    acct.bound_player_id = p_id             -- 密码已验证过，把绑定刷新到本次连接
+    set_account(p_name, acct)
     touch_session(p_id)
     return "Welcome, " .. p_name .. "! Rank: [" .. (acct.rank or "player") .. "]"
 end
@@ -314,7 +370,7 @@ end
 local function cmd_changepass(p_id, p_name, parts)
     if not rank_at_least(p_id, "player") then return "Login required." end
     if #parts < 3 then return "Usage: /changepass <old> <new>" end
-    local acct = get_account(p_name)
+    local acct = get_account(my_account_name(p_id, p_name))
     if not acct then return "Account error." end
     if acct.hash ~= hash_password(parts[2]) then return "Old password incorrect." end
     if #parts[3] < 3 then return "New password must be >= 3 chars." end
@@ -325,11 +381,13 @@ local function cmd_changepass(p_id, p_name, parts)
 end
 
 local function cmd_whoami(p_id, p_name)
-    local acct = get_account(p_name)
-    local rank = acct and (acct.rank or "player") or "guest"
     local sess = get_session(p_id)
+    local acct_name = my_account_name(p_id, p_name)
+    local acct = get_account(acct_name)
+    local rank = acct and (acct.rank or "player") or "guest"
     local status = (sess and sess.logged_in) and "Logged in" or "Not logged in"
-    return string.format("%s | %s | Rank: %s | P_ID: %d", p_name, status, rank, p_id)
+    return string.format("%s | %s | Rank: %s | P_ID: %d | display: %s",
+        acct_name, status, rank, p_id, p_name)
 end
 
 ---------------------------------------------------------------------------
@@ -690,12 +748,47 @@ end
 ---------------------------------------------------------------------------
 -- 8. 调试工具
 ---------------------------------------------------------------------------
+-- ⚠️ 引擎对象（player / entity / Chat 表 ...）很可能是 **userdata**。
+-- 2026-03 的会话就是因为用 pairs() 遍历 Chat userdata 崩的：
+--   bad argument #1 to 'for iterator' (table expected, got userdata)
+-- 所以这里一律：先试 pairs，失败就退回「已知字段白名单」。
+local PLAYER_FIELDS = { "id", "name", "faction_id", "ready", "is_local", "is_host" }
+
+local function player_summary(p)
+    local lines = {}
+    local seen = {}
+    for _, k in ipairs(PLAYER_FIELDS) do
+        local ok, v = pcall(function() return p[k] end)
+        if ok and v ~= nil then
+            seen[k] = true
+            lines[#lines + 1] = "  " .. k .. " = " .. tostring(v)
+        end
+    end
+    if type(p) == "table" then
+        local ok, iter = pcall(function() return pairs(p) end)
+        if ok and iter then
+            for k, v in iter do
+                if not seen[k] then lines[#lines + 1] = "  " .. tostring(k) .. " = " .. tostring(v) end
+            end
+        end
+    end
+    if #lines == 0 then
+        lines[1] = "  (无可读字段；对象类型 = " .. type(p) .. ")"
+    end
+    return table.concat(lines, "\n")
+end
+
 local function table_dump(tbl, indent)
     indent = indent or 0
     local prefix = string.rep("  ", indent)
     if type(tbl) ~= "table" then return prefix .. tostring(tbl) end
+    if indent > 3 then return prefix .. "(...)" end
     local lines = {}
-    for k, v in pairs(tbl) do
+    local ok, iter = pcall(function() return pairs(tbl) end)
+    if not ok or not iter then
+        return prefix .. "(不可遍历，类型 = " .. type(tbl) .. ")"
+    end
+    for k, v in iter do
         local vt = type(v)
         if vt == "table" then
             lines[#lines + 1] = prefix .. tostring(k) .. ": {"
@@ -714,16 +807,16 @@ _G.CmdServerMod._dump_player = function(parts, my_id)
     local tid = tonumber(parts[2]) or my_id
     local ok, p = pcall(function() return Game.GetPlayerById(tid) end)
     if not ok or not p then return "Player P" .. tid .. " not found" end
-    return "=== P" .. tid .. " ===\n" .. table_dump(p, 0)
+    return "=== P" .. tid .. " (type=" .. type(p) .. ") ===\n" .. player_summary(p)
 end
 
 _G.CmdServerMod._dump_all_players = function()
     local ok, pl = pcall(function() return Game.GetAllPlayers() end)
-    if not ok or not pl then return "Error" end
+    if not ok or type(pl) ~= "table" then return "Error: GetAllPlayers unavailable" end
     local lines = { "=== Players (" .. #pl .. ") ===" }
     for i, p in ipairs(pl) do
-        lines[#lines + 1] = "-- #" .. i .. " --"
-        lines[#lines + 1] = table_dump(p, 0)
+        lines[#lines + 1] = "-- #" .. i .. " (type=" .. type(p) .. ") --"
+        lines[#lines + 1] = player_summary(p)
     end
     return table.concat(lines, "\n")
 end
@@ -784,7 +877,7 @@ function PlayerAction.CmdServerExec(player_id, faction, arg)
                 pcall(function()
                     Action.RunUI(function(pid)
                         if Chat and Chat.Text then
-                            Chat.Text({ txt = "[SERVER] You have been logged out due to inactivity. Use /login to sign in.", player_id = pid }, pid)
+                            Chat.Text({ txt = "[SERVER] 请使用 /login <密码> 登录。", player_id = pid }, pid)
                         end
                     end, rpid)
                 end)
@@ -828,7 +921,7 @@ function MapMsg.OnTick()
     tick_counter = tick_counter + 1
 
     -- 每秒检测玩家加入/离开 + 自动登出
-    if tick_counter % 5 == 0 then
+    if tick_counter % PRESENCE_CHECK_TICKS == 0 then
         local now = Map.GetTick()
         local ok, cur = pcall(function() return Game.GetAllPlayers() end)
         if ok and cur then
@@ -845,10 +938,29 @@ function MapMsg.OnTick()
                     _G.CmdServerMod._sessions[p.id].last_seen = now
                 end
             end
+            -- ★ 关键：任何「玩家已不在线」的 session 立即失效。
+            -- 不能只依赖下面的 leave 检测 —— 它依赖 _known_players，而玩家完全可能在
+            -- 两次检测之间进出（<1 秒），那样 session 会带着 logged_in=true 留下来；
+            -- 之后 player id 被回收给另一个人，那人在 init_session 里就会命中早退分支
+            -- 直接继承前一个人的登录身份。这里按「当前在线列表」兜底扫描。
+            for sid, sess in safe_pairs(_G.CmdServerMod._sessions) do
+                if online_ids[sid] == nil and sess.logged_in then
+                    sess.logged_in = false
+                    sess.acct_name = nil
+                    srv_print("LOGOUT", string.format("session P%d 失效（玩家已离线）", sid))
+                end
+            end
+
             -- 检测离开
+            -- 顺便清理 _known_players（同一 id 会被回收再利用）
             for kid, kname in pairs(_G.CmdServerMod._known_players) do
                 if not online_ids[kid] then
                     _G.CmdServerMod._known_players[kid] = nil
+                    local sess = _G.CmdServerMod._sessions[kid]
+                    if sess then
+                        sess.logged_in = false
+                        sess.acct_name = nil
+                    end
                     srv_print("LEAVE", string.format("- %s (P%d)", kname, kid))
                 end
             end
@@ -868,7 +980,7 @@ function MapMsg.OnTick()
             end
             -- 清理彻底过期 session（登出且离线超 600 ticks）
             if not sess.logged_in and sess.last_seen then
-                if now - sess.last_seen > 600 then
+                if now - sess.last_seen > SESSION_GC_TICKS then
                     _G.CmdServerMod._sessions[pid] = nil
                 end
             end
@@ -876,7 +988,7 @@ function MapMsg.OnTick()
     end
 
     -- 每60秒心跳
-    if tick_counter >= 300 then
+    if tick_counter >= HEARTBEAT_TICKS then
         tick_counter = 0
         local pc, ac = 0, 0
         pcall(function()
