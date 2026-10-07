@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.4"
+local version = "1.9.5"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -633,27 +633,55 @@ local function apply_session_setting(key, val)
     return false, "engine rejected the change"
 end
 
+-- 格式化一个设置值（表格只显示类型，避免刷屏）
+local function fmt_setting(v)
+    local t = type(v)
+    if t == "table" then return "{table}" end
+    if t == "string" then return v end
+    return tostring(v)
+end
+
+-- 列出某个设置表的全部键（排序、带可写标记、限长）
+local function list_settings(title, tbl, allow, max_lines)
+    local lines = { title }
+    if type(tbl) ~= "table" then
+        -- 引擎可能把它做成 userdata：那就退回白名单键（索引是安全的）
+        for k in pairs(allow) do
+            local ok, v = pcall(function() return tbl[k] end)
+            if ok and v ~= nil then
+                lines[#lines + 1] = "  " .. k .. " = " .. fmt_setting(v) .. (allow[k] and " *" or "")
+            end
+        end
+        if #lines == 1 then lines[#lines + 1] = "  (不可枚举，且白名单键也读不到)" end
+        return lines
+    end
+    local ks = {}
+    for k in safe_pairs(tbl) do ks[#ks + 1] = tostring(k) end
+    table.sort(ks)
+    for i, k in ipairs(ks) do
+        if max_lines and i > max_lines then
+            lines[#lines + 1] = "  … 以及另外 " .. (#ks - max_lines) .. " 项"
+            break
+        end
+        local v = tbl[k]
+        lines[#lines + 1] = "  " .. k .. " = " .. fmt_setting(v) .. (allow[k] and " *" or "")
+    end
+    if #ks == 0 then lines[#lines + 1] = "  (空)" end
+    return lines
+end
+
 local function cmd_settings(p_id, parts)
     if #parts < 2 then
-        -- 查看模式：固定键列表（不 pairs 遍历，避免 userdata 报错）
-        local lines = { "=== Game Settings (map) ===" }
+        -- 查看模式：**列出全部键**（只读安全），带 * 的才是可改的。
+        -- 原实现只列 4 个地图键 + 3 个会话键，管理员看不到全貌。
         local ok, ms = pcall(function() return Map.GetSettings() end)
-        if ok and ms then
-            for k in pairs(MAP_SETTING_ALLOW) do
-                local v = ms[k]
-                if v ~= nil then lines[#lines + 1] = "  " .. k .. ": " .. tostring(v) end
-            end
-        end
-        lines[#lines + 1] = "=== Session Settings ==="
+        local lines = list_settings("=== Game Settings (map) ===",
+            ok and ms or nil, MAP_SETTING_ALLOW, 60)
         local ok2, ss = pcall(function() return Game.GetHostSessionSettings() end)
-        if ok2 and type(ss) == "table" then
-            for k in pairs(SESSION_SETTING_ALLOW) do
-                if ss[k] ~= nil then lines[#lines + 1] = "  " .. k .. ": " .. tostring(ss[k]) end
-            end
-        else
-            lines[#lines + 1] = "  (unavailable on this build)"
-        end
-        lines[#lines + 1] = "Usage: /settings set <key> <value>"
+        local slines = list_settings("=== Session Settings ===",
+            ok2 and ss or nil, SESSION_SETTING_ALLOW, 30)
+        for _, l in ipairs(slines) do lines[#lines + 1] = l end
+        lines[#lines + 1] = "* = 可用 /settings set <key> <value> 修改；其余为只读"
         return table.concat(lines, "\n")
     end
 
