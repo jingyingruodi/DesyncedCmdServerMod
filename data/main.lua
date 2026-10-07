@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.10"
+local version = "1.10.0"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -106,6 +106,11 @@ local function set_account(name, data)
 end
 
 local RANK_LEVEL = { guest = 0, player = 1, admin = 2, superadmin = 3 }
+
+-- 后台控制台的保留身份（负数，绝不与真实玩家 id >= 0 冲突）。
+-- 定义必须早于 execute_command，因为后者要据此跳过 ensure_session。
+local CONSOLE_ID = -1000
+local CONSOLE_NAME = "__console__"
 
 local function get_session(p_id)
     if not _G.CmdServerMod._sessions then return nil end
@@ -206,6 +211,32 @@ local LOG_CHAT     = true   -- 播报玩家聊天
 local LOG_COMMANDS = true   -- 播报指令输入（密码类已脱敏）
 local LOG_RESULTS  = true   -- 播报指令结果（SECRET 类永远不走这里）
 
+---------------------------------------------------------------------------
+-- ★ 后台输入通道：引擎自带的 Lua 调试器（lrdb）
+---------------------------------------------------------------------------
+-- 问题：专用服务器**后台无法输入**（用户实测 + 我们也确认 stdin 无效），
+--       而模组沙箱既没有文件 I/O 也没有网络，所以没有任何「从外部送指令进去」的路。
+--
+-- 引擎其实自带了解法：lrdb 调试服务器（127.0.0.1:21110，换行分隔 JSON-RPC）。
+-- 客户端加 -moddev 就会开；但**多人游戏里引擎默认把它关掉**，需要用
+--   Debug.AllowDebuggerInMultiplayer()  -- 官方文档："Enable the LUA debugger server
+--                                          even while playing multiplayer"
+-- 显式打开。打开后即可用 tools/lrdb.py 在**运行中的服务器里直接 eval Lua**，
+-- 这就等价于一个可编程的后台控制台。
+--
+-- ⚠️ 安全：调试器可以执行任意 Lua，等于把服务器完全交出去。
+--    只在确实需要时打开，并且**绝不要**把 21110 暴露到本机之外。
+local ENABLE_LUA_DEBUGGER = false  -- 需要后台控制台时改 true（并要求启动参数带 -moddev）
+
+-- 必须在**文件加载时**就调用：ensure_init 依赖 OnTick，而无人连接时 OnTick 不触发，
+-- 那样调试器永远不会被打开（实测：放在 ensure_init 里完全不生效）。
+if ENABLE_LUA_DEBUGGER then
+    pcall(function()
+        Debug.AllowDebuggerInMultiplayer()
+        print("[CmdServerMod] 已请求开启 Lua 调试器 (Debug.AllowDebuggerInMultiplayer)")
+    end)
+end
+
 -- 模拟速率：游戏本体 data/instructions.lua 里写明 "5 simulation ticks per second"
 local TICKS_PER_SECOND = 5
 
@@ -233,7 +264,10 @@ local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 local function encode_accounts(accounts)
     local parts = {}
     for name, acct in safe_pairs(accounts) do
-        parts[#parts + 1] = name .. ":" .. acct.hash .. ":" .. (acct.rank or "player")
+        -- 跳过控制台保留账号：它不是真人账号，不该被导出/迁移
+        if not acct.__console then
+            parts[#parts + 1] = name .. ":" .. acct.hash .. ":" .. (acct.rank or "player")
+        end
     end
     local raw = table.concat(parts, "|")
     local enc = {}
@@ -418,7 +452,9 @@ local function ensure_init()
                 -- 在拿到第一个超管之前，运维必须能看到 key。拿到后请勿再用 /setupkey show，
                 -- 或直接用 -SetupKey= 启动以免出现这一行。
                 srv_print("SYSTEM", "========================================================")
-                srv_print("SYSTEM", "INITIAL SETUP KEY: " .. ms.setup_key)
+                if not _G.CmdServerMod._setupkey_from_console then
+                    srv_print("SYSTEM", "INITIAL SETUP KEY: " .. ms.setup_key)
+                end
                 srv_print("SYSTEM", "Register immediately, or restart with -SetupKey=<key> to avoid printing.")
                 srv_print("SYSTEM", "========================================================")
             end
@@ -832,7 +868,12 @@ _G.CmdServerMod.execute_command = function(text, p_id)
     pcall(function() local p = Game.GetPlayerById(p_id); if p then p_name = p.name or "?" end end)
 
     -- 惰性初始化会话（游戏暂停时 OnTick 不触发，在此补建）
-    ensure_session(p_id, p_name)
+    -- ⚠️ 控制台身份必须跳过：ensure_session 会拿 Game.GetPlayerById 的名字
+    --    （控制台没有对应玩家 → "Unknown"）与现会话比较，不一致就**整条重建**成访客，
+    --    于是 console_exec 永远拿不到超管权限（实测踩过）。
+    if p_id ~= CONSOLE_ID then
+        ensure_session(p_id, p_name)
+    end
 
     -- ★ 兜底初始化：OnTick 可能永不触发（暂停 / run_without_players=false 且无人连接），
     -- 那时 setup key 就不存在，/register 会永远返回 "Server initializing"，全服没人能当超管。
@@ -1227,6 +1268,83 @@ function PlayerAction.CmdServerExec(player_id, faction, arg)
             end)
         end
     end
+end
+
+-- ★★ 后台控制台入口（服务器后台无法输入这件事的正式解法）★★
+--
+-- 链路：lrdb 调试器（127.0.0.1:21110，由 Debug.AllowDebuggerInMultiplayer 打开）
+--       → eval _G.CmdServerMod.console_exec("/diag")
+--       → 以「控制台」这个保留身份（超管）执行模组指令。
+-- 于是专用服务器有了一个**可编程的后台控制台**，不需要任何玩家在线。
+--
+-- 安全性：
+--   * 调试器是**默认关闭**的（ENABLE_LUA_DEBUGGER=false）；只有显式打开才会监听。
+--   * 引擎的调试器只绑 127.0.0.1，不对公网开放。
+--   * console_exec 存在与否本身无害 —— 够不到它（没有调试器）就无法利用。
+--   * 控制台身份是一个保留的负数 id，绝不会与真实玩家（>=0）冲突。
+local function ensure_console_session()
+    local ms = get_ms()
+    if type(ms.accounts) ~= "table" then ms.accounts = {} end
+    local acct = ms.accounts[CONSOLE_NAME]
+    if not acct then
+        ms.accounts[CONSOLE_NAME] = {
+            hash = 0, rank = "superadmin", bound_player_id = CONSOLE_ID,
+            __console = true,   -- 标记：这不是真人账号，/account export 时跳过
+        }
+    elseif acct.rank ~= "superadmin" then
+        acct.rank = "superadmin"
+    end
+    _G.CmdServerMod._sessions[CONSOLE_ID] = {
+        name = CONSOLE_NAME, acct_name = CONSOLE_NAME,
+        logged_in = true, last_seen = Map.GetTick(),
+    }
+end
+
+-- 执行一条后台指令，**把结果返回给调用者**（而不是打印 —— 打印会广播给客户端）。
+-- 返回值：ok(boolean), 结果文本(string)
+_G.CmdServerMod.console_exec = function(text)
+    if type(text) ~= "string" or text:sub(1, 1) ~= "/" then
+        return false, "usage: console_exec('/命令 参数')"
+    end
+    local ok0, err0 = pcall(function()
+        ensure_init()
+        ensure_console_session()
+    end)
+    if not ok0 then return false, "console init failed: " .. tostring(err0) end
+    -- ⚠️ execute_command 自身返回 (ok, result[, secret])，外面再套 pcall 就多一层：
+    --    pcall → (true, cmd_ok, result) —— 少取一层会把 cmd_ok 当成结果文本。
+    local pcall_ok, cmd_ok, result = pcall(_G.CmdServerMod.execute_command, text, CONSOLE_ID)
+    if not pcall_ok then return false, "exec failed: " .. tostring(cmd_ok) end
+    if not cmd_ok then return false, tostring(result) end
+    return true, tostring(result)
+end
+
+-- 由运维从调试器直接设定 setup key —— **完全不经过 print**，
+-- 因此不会像「首次自动生成」那样把密钥广播给所有客户端。
+-- 用法：_G.CmdServerMod.console_set_setupkey("你的密钥")
+_G.CmdServerMod.console_set_setupkey = function(key)
+    if type(key) ~= "string" or #key < 4 then
+        return false, "密钥太短（至少 4 个字符）"
+    end
+    -- ★ 先立标记再 ensure_init：ensure_init 在首次初始化时会打印自动生成的密钥，
+    --   而运维既然从后台指定了密钥，就绝不该再打印任何东西。
+    _G.CmdServerMod._setupkey_from_console = true
+    local ok, err = pcall(function()
+        ensure_init()
+        get_ms().setup_key = key
+    end)
+    if not ok then
+        _G.CmdServerMod._setupkey_from_console = nil
+        return false, tostring(err)
+    end
+    return true, "已设定（不会打印）"
+end
+
+-- 当前 setup key（供运维从调试器私密读取；不会打印）
+_G.CmdServerMod.console_get_setupkey = function()
+    local ok, v = pcall(function() ensure_init(); return get_ms().setup_key end)
+    if not ok then return nil end
+    return v
 end
 
 -- ★ 联调自动执行（autorun）
