@@ -1,9 +1,22 @@
--- Desynced Command Console - Core Logic (v1.8.0)
+-- Desynced Command Console - Core Logic (v1.9.0)
 -- 职责：外置存储 + 随机密钥 + 自动登出 + 权限系统 + 密码脱敏 + 暂停兼容
+--
+-- v1.9.0 变更（每条都有代码级或游戏源码级证据，详见 notes/接手现状与发现.md）：
+--   1. setup key 改用幂等 ensure_init()，并在指令入口兜底调用
+--      原来只在 OnTick 首帧生成 —— 模拟不推进（暂停/无人连接）时全服无人能注册超管
+--   2. 机密结果（/account export、/setupkey show）不再走 srv_print。
+--      Simulation 层 print 会同步到所有客户端调试日志（用户 2026-07 的客户端日志已证实），
+--      原实现等于把账户数据与 setup key 广播给全服 → 拿到 key 即可提权
+--   3. setup key 支持服务器命令行 -SetupKey=xxx 注入（推荐）；此路径下**绝不打印**
+--   4. /settings set 改为「白名单 + 回读比对」判成败，并拒绝世界生成类键
+--      （原来用 pcall 判成功，未知键也报成功；会话设置分支还是死代码）
+--   5. 指令通道 FactionAction → PlayerAction：player_id 由引擎提供，客户端无法冒充
+--   6. 存档读写改用 Map.GetSave() 的 mod 专属子表（原来多套一层）
+--   7. KickPlayer 不再 pcall 吞错后谎报成功
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.8.0"
+local version = "1.9.0"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -38,20 +51,41 @@ local function random_str(len)
     return table.concat(t)
 end
 
+-- 私有结果标记：命令返回 (true, text, SECRET) 表示该文本**不得**进入会广播的 print，
+-- 只能通过 Action.RunUI 私聊给发起者。（Simulation 层 print 会同步到所有客户端日志）
+local SECRET = {}
+
+-- 从服务器命令行读取 -SetupKey=xxx
+-- 这是唯一「不泄露」的 setup key 注入方式：命令行只有服务器运维能看到。
+local function setup_key_from_cmdline()
+    local ok, args = pcall(function() return Game.GetCommandLineArguments() end)
+    if not ok or type(args) ~= "string" then return nil end
+    local v = args:match("%-SetupKey=([%w_%-]+)") or args:match("%-setupkey=([%w_%-]+)")
+    if v and #v >= 4 then return v end
+    return nil
+end
+
 srv_print("CmdServerMod", "Data Layer Booting v" .. version)
 
 ---------------------------------------------------------------------------
 -- 1. 数据访问层 (Map.GetSave 存档内持久化，跨存档用 /account export/import)
 ---------------------------------------------------------------------------
+-- Map.GetSave() 无参时，对「不含当前 scenario 的 mod」返回本 mod 的专属子表
+-- parent.mods[mod_id]，因此直接用它的字段即可，不必再套一层。
 local function get_ms()
     local save = Map.GetSave()
-    if not save.CmdServerMod then
-        save.CmdServerMod = { accounts = {}, setup_key = "" }
+    -- 一次性迁移：v1.8.0 曾写到 save.CmdServerMod.*
+    if type(save.CmdServerMod) == "table" then
+        local old = save.CmdServerMod
+        if old.accounts and not save.accounts then save.accounts = old.accounts end
+        if old.setup_key and old.setup_key ~= "" and not save.setup_key then
+            save.setup_key = old.setup_key
+        end
+        save.CmdServerMod = nil
     end
-    local ms = save.CmdServerMod
-    if not ms.accounts then ms.accounts = {} end
-    if not ms.setup_key then ms.setup_key = "" end
-    return ms
+    if not save.accounts then save.accounts = {} end
+    if not save.setup_key then save.setup_key = "" end
+    return save
 end
 
 local function get_account(name)
@@ -183,6 +217,62 @@ local function do_import(encoded, source)
 end
 
 ---------------------------------------------------------------------------
+-- 3.5 幂等初始化（必须在游戏已开始之后调用；Map.GetSave 在此之前不可用）
+---------------------------------------------------------------------------
+-- 既从 MapMsg.OnTick 调用，也从指令入口调用 —— 因为游戏暂停/无人连接时 OnTick 不触发，
+-- 而 setup key 只在初始化时生成，否则 /register 会永远返回「Server initializing」，
+-- 全服没有人能成为超管。
+local function ensure_init()
+    if _G.CmdServerMod._init_done then return true end
+    local ok, err = pcall(function()
+        local ms = get_ms()
+
+        if ms.setup_key == "" then
+            local from_cmd = setup_key_from_cmdline()
+            if from_cmd then
+                ms.setup_key = from_cmd
+                srv_print("SYSTEM", "Setup key loaded from command line (-SetupKey). It is never printed.")
+            else
+                ms.setup_key = random_str(12)
+                -- ⚠️ 下面这一行会同步到所有客户端调试日志。这是 bootstrap 的固有代价：
+                -- 在拿到第一个超管之前，运维必须能看到 key。拿到后请勿再用 /setupkey show，
+                -- 或直接用 -SetupKey= 启动以免出现这一行。
+                srv_print("SYSTEM", "========================================================")
+                srv_print("SYSTEM", "INITIAL SETUP KEY: " .. ms.setup_key)
+                srv_print("SYSTEM", "Register immediately, or restart with -SetupKey=<key> to avoid printing.")
+                srv_print("SYSTEM", "========================================================")
+            end
+        else
+            srv_print("SYSTEM", "Setup key loaded from save.")
+        end
+
+        -- GameSettings 命令行导入
+        local ok_gs, gs = pcall(function() return Map.GetSettings() end)
+        if ok_gs and gs and gs.CmdServerMod_import then
+            local data = tostring(gs.CmdServerMod_import)
+            if #data > 10 then
+                local ok_imp, count = do_import(data, "GameSettings")
+                if ok_imp then
+                    srv_print("SYSTEM", "GameSettings import: " .. tostring(count) .. " accounts loaded")
+                end
+            end
+        end
+    end)
+    if not ok then
+        -- 典型：Unable to access save table before game has started —— 下次再试
+        if os.getenv and os.getenv("CmdServerMod_DEBUG") then
+            srv_print("DEBUG", "ensure_init deferred: " .. tostring(err))
+        end
+        return false
+    end
+    _G.CmdServerMod._init_done = true
+    return true
+end
+
+-- 供调试/测试使用
+_G.CmdServerMod._ensure_init = ensure_init
+
+---------------------------------------------------------------------------
 -- 4. 账户命令
 ---------------------------------------------------------------------------
 local function cmd_register(p_id, p_name, parts)
@@ -298,8 +388,28 @@ local function cmd_kick(parts, p_id)
     if rank_at_least(tid, "admin") and not rank_at_least(p_id, "superadmin") then
         return "Cannot kick another Admin."
     end
-    pcall(function() Game.KickPlayer(tid, do_ban) end)
-    srv_print("ADMIN", (do_ban and "Banned " or "Kicked ") .. tname)
+
+    -- 不要 pcall 吞错后谎报成功。文档明确 KickPlayer「only available to the host of a
+    -- locally running session」，专用服务器上很可能是空操作，所以要复查结果。
+    local ok, err = pcall(function() Game.KickPlayer(tid, do_ban) end)
+    if not ok then
+        srv_print("ADMIN", "KickPlayer failed: " .. tostring(err))
+        return "Kick failed: " .. tostring(err)
+    end
+
+    local still_online = false
+    pcall(function()
+        for _, p in ipairs(Game.GetAllPlayers()) do
+            if p.id == tid then still_online = true; break end
+        end
+    end)
+
+    if still_online then
+        srv_print("ADMIN", "KickPlayer had no effect (host-only API?) for " .. tname)
+        return "Kick was accepted but '" .. tname .. "' is still online "
+            .. "(Game.KickPlayer only works for the host of a locally running session)."
+    end
+    srv_print("ADMIN", (do_ban and "Banned " or "Kicked ") .. tname .. " (by P" .. tostring(p_id) .. ")")
     return "Player '" .. tname .. "' " .. (do_ban and "banned." or "kicked.")
 end
 
@@ -314,51 +424,92 @@ local function cmd_speed(parts, p_id)
         return "Current speed: " .. (cur == 0 and "PAUSE" or "x" .. cur) .. ". Usage: /speed <0|1|2|...>"
     end
     local spd = tonumber(parts[2])
-    if not spd or spd < 0 then return "Speed must be >= 0 (integer)." end
+    if not spd or spd < 0 then return "Speed must be >= 0 (integer, 0 = pause)." end
     spd = math.floor(spd)
+    -- 上界：本体自己用 0/1/2/5/10；超出引擎会拒绝。这里先挡一道，并且不用裸调用。
+    local MAX_SPEED = 32
+    if spd > MAX_SPEED then
+        return string.format("Speed must be between 0 and %d (0 = pause).", MAX_SPEED)
+    end
     if spd == 0 then
         pcall(function() speed_before_pause = Map.GetGameSpeed() end)
         if speed_before_pause == 0 then speed_before_pause = 1 end
     end
-    Map.SetGameSpeed(spd)
+    local ok_set, err_set = pcall(function() Map.SetGameSpeed(spd) end)
+    if not ok_set then
+        return "SetGameSpeed failed: " .. tostring(err_set)
+    end
     local desc
     if spd == 0 then desc = "PAUSE (was x" .. speed_before_pause .. ")"
     elseif spd == 1 then desc = "NORMAL"
     else desc = "x" .. spd end
-    srv_print("ADMIN", "Speed set to " .. desc)
+    srv_print("ADMIN", "Speed set to " .. desc .. " (by P" .. tostring(p_id) .. ")")
     return "Game speed: " .. desc
 end
 
 ---------------------------------------------------------------------------
 -- 6. 游戏规则查看/修改
 ---------------------------------------------------------------------------
+-- 只允许改动「运行期安全」的键。其余一律拒绝：
+--   文档 Map.ModifySettings 明确警告：影响世界生成或太阳模拟的设置在开局后修改会导致
+--   游戏崩溃或不同步（seed / elevation_params_* / blight_threshold / plateau_level /
+--   landscape / resource_* / enable_day_night / day_period / days_per_year ...）。
+local MAP_SETTING_ALLOW = {
+    peaceful = true, creep = true, difficulty = true, disable_minigames = true,
+}
+-- 会话设置（Game.GetHostSessionSettings），不是地图设置
+local SESSION_SETTING_ALLOW = {
+    allow_faction_switch = true, disable_client_save = true, behavior_limit = true,
+}
+
+-- 用「改前改后回读比对」判定成败。
+-- 原来用 pcall 的返回值判定是不可靠的：Map.ModifySettings 对未知键既不报错也不生效。
+local function apply_map_setting(key, val)
+    local ok, before = pcall(function() return Map.GetSettings()[key] end)
+    if not ok then return false, "Map.GetSettings() unavailable" end
+    if before == nil then return false, "'" .. key .. "' is not a map setting" end
+    local ok2, err = pcall(function() Map.ModifySettings(key, val) end)
+    if not ok2 then return false, tostring(err) end
+    local ok3, after = pcall(function() return Map.GetSettings()[key] end)
+    if not ok3 then return false, "cannot read back the setting" end
+    if after == val then return true end
+    pcall(function() Map.ModifySettings(key, before) end) -- 回滚
+    return false, string.format("engine kept %s (asked for %s)", tostring(after), tostring(val))
+end
+
+local function apply_session_setting(key, val)
+    local ok, ss = pcall(function() return Game.GetHostSessionSettings() end)
+    if not ok or type(ss) ~= "table" then return false, "session settings unavailable" end
+    if ss[key] == nil then return false, "'" .. key .. "' is not a session setting" end
+    local before = ss[key]
+    local ok2, err = pcall(function() Game.ModifyHostSessionSettings({ [key] = val }) end)
+    if not ok2 then return false, tostring(err) end
+    local ok3, ss2 = pcall(function() return Game.GetHostSessionSettings() end)
+    if ok3 and type(ss2) == "table" and ss2[key] == val then return true end
+    pcall(function() Game.ModifyHostSessionSettings({ [key] = before }) end) -- 回滚
+    return false, "engine rejected the change"
+end
+
 local function cmd_settings(p_id, parts)
     if #parts < 2 then
-        -- 查看模式
-        local lines = { "=== Game Settings ===" }
+        -- 查看模式：固定键列表（不 pairs 遍历，避免 userdata 报错）
+        local lines = { "=== Game Settings (map) ===" }
         local ok, ms = pcall(function() return Map.GetSettings() end)
         if ok and ms then
-            -- 常用关键字段
-            local keys = { "difficulty", "peaceful", "creep", "allow_faction_switch",
-                           "resource_inf", "resource_amt", "enable_day_night",
-                           "days_per_year", "day_night_ratio", "day_period" }
-            for _, k in ipairs(keys) do
+            for k in pairs(MAP_SETTING_ALLOW) do
                 local v = ms[k]
-                if v ~= nil then
-                    lines[#lines + 1] = "  " .. k .. ": " .. tostring(v)
-                end
+                if v ~= nil then lines[#lines + 1] = "  " .. k .. ": " .. tostring(v) end
             end
         end
-        -- 会话设置
-        pcall(function()
-            local ss = Game.GetHostSessionSettings()
-            if ss then
-                lines[#lines + 1] = "--- Session ---"
-                for k, v in pairs(ss) do
-                    lines[#lines + 1] = "  " .. k .. ": " .. tostring(v)
-                end
+        lines[#lines + 1] = "=== Session Settings ==="
+        local ok2, ss = pcall(function() return Game.GetHostSessionSettings() end)
+        if ok2 and type(ss) == "table" then
+            for k in pairs(SESSION_SETTING_ALLOW) do
+                if ss[k] ~= nil then lines[#lines + 1] = "  " .. k .. ": " .. tostring(ss[k]) end
             end
-        end)
+        else
+            lines[#lines + 1] = "  (unavailable on this build)"
+        end
         lines[#lines + 1] = "Usage: /settings set <key> <value>"
         return table.concat(lines, "\n")
     end
@@ -376,42 +527,46 @@ local function cmd_settings(p_id, parts)
     elseif val_str == "false" then val = false
     else val = tonumber(val_str) or val_str end
 
-    -- 方式1: Map.ModifySettings({key, val}) — 地图参数（difficulty, peaceful等）
-    local ok1 = pcall(function()
-        Map.ModifySettings({ key, val })
-        srv_print("SETTINGS", key .. " changed to " .. tostring(val))
-    end)
-    if ok1 then return key .. " = " .. tostring(val) end
+    local is_map = MAP_SETTING_ALLOW[key] == true
+    local is_session = SESSION_SETTING_ALLOW[key] == true
+    if not is_map and not is_session then
+        return "'" .. key .. "' is not runtime-changeable. Allowed: "
+            .. "peaceful, creep, difficulty, disable_minigames (map); "
+            .. "allow_faction_switch, disable_client_save, behavior_limit (session)"
+    end
 
-    -- 方式2: Game.ModifyHostSessionSettings — 会话参数（allow_faction_switch等）
-    local ok2 = pcall(function()
-        local ss = Game.GetHostSessionSettings()
-        if ss and ss[key] ~= nil then
-            ss[key] = val
-            Game.ModifyHostSessionSettings(ss)
-            srv_print("SETTINGS", key .. " (session) changed to " .. tostring(val))
-            return true
+    -- 会话键优先走会话 API：allow_faction_switch 这类键**不在** Map.GetSettings() 里
+    local order = is_session and { apply_session_setting, apply_map_setting }
+                             or  { apply_map_setting, apply_session_setting }
+    local last_err
+    for _, fn in ipairs(order) do
+        local ok, err = fn(key, val)
+        if ok then
+            srv_print("SETTINGS", key .. " = " .. tostring(val) .. " (by P" .. tostring(p_id) .. ")")
+            return key .. " = " .. tostring(val)
         end
-    end)
-    if ok2 then return key .. " = " .. tostring(val) end
-
-    return "Failed to modify '" .. key .. "'."
+        last_err = err
+    end
+    return "Failed to modify '" .. key .. "': " .. tostring(last_err)
 end
+
 local function cmd_setup_key(p_id, parts)
     if not rank_at_least(p_id, "superadmin") then return "Access denied." end
     local ms = get_ms()
     if #parts < 2 then
         if ms.setup_key == "" then return "No setup key configured." end
-        return "Setup key is set. Use /setupkey show to reveal."
+        return "Setup key is set. Use /setupkey show to reveal it privately."
     end
     local sub = parts[2]:lower()
     if sub == "show" then
         if ms.setup_key == "" then return "No setup key configured." end
-        return "Setup key: " .. ms.setup_key
+        -- ★ 机密：不能走 srv_print（会同步给所有客户端）
+        srv_print("SECRET", "P" .. tostring(p_id) .. " revealed the setup key (value withheld from log)")
+        return "Setup key: " .. ms.setup_key, SECRET
     elseif sub == "regen" then
         ms.setup_key = random_str(12)
-        srv_print("SYSTEM", "Setup key regenerated")
-        return "New setup key generated. Use /setupkey show to view."
+        srv_print("SYSTEM", "Setup key regenerated by P" .. tostring(p_id))
+        return "New setup key generated. Use /setupkey show to view it privately.", SECRET
     else
         return "Usage: /setupkey <show|regen>"
     end
@@ -420,8 +575,9 @@ end
 local function cmd_account_export(p_id)
     if not rank_at_least(p_id, "superadmin") then return "Access denied." end
     local data = encode_accounts(get_ms().accounts)
-    srv_print("EXPORT", "Manual export (" .. #data .. " chars)")
-    return "[EXPORT]\n" .. data .. "\n[END]"
+    -- ★ 机密：账户数据绝不能进入会广播的 print
+    srv_print("SECRET", "P" .. tostring(p_id) .. " exported accounts (" .. #data .. " chars, withheld)")
+    return "[EXPORT]\n" .. data .. "\n[END]", SECRET
 end
 
 local function cmd_account_import(p_id, parts)
@@ -448,6 +604,10 @@ _G.CmdServerMod.execute_command = function(text, p_id)
 
     -- 惰性初始化会话（游戏暂停时 OnTick 不触发，在此补建）
     ensure_session(p_id, p_name)
+
+    -- ★ 兜底初始化：OnTick 可能永不触发（暂停 / run_without_players=false 且无人连接），
+    -- 那时 setup key 就不存在，/register 会永远返回 "Server initializing"，全服没人能当超管。
+    ensure_init()
 
     -- 更新活跃时间（除 help/ping 外均视为活跃）
     if cmd ~= "help" and cmd ~= "ping" then touch_session(p_id) end
@@ -505,12 +665,15 @@ _G.CmdServerMod.execute_command = function(text, p_id)
 
     elseif cmd == "account" then
         local sub = (parts[2] or ""):lower()
-        if sub == "export" then return true, cmd_account_export(p_id)
+        if sub == "export" then
+            local text_out, secret = cmd_account_export(p_id)
+            return true, text_out, secret
         elseif sub == "import" then return true, cmd_account_import(p_id, parts)
         else return true, "Usage: /account <export|import>" end
 
     elseif cmd == "setupkey" then
-        return true, cmd_setup_key(p_id, parts)
+        local text_out, secret = cmd_setup_key(p_id, parts)
+        return true, text_out, secret
 
     elseif cmd == "playerinfo" then
         if not rank_at_least(p_id, "superadmin") then return true, "Access denied." end
@@ -588,20 +751,31 @@ local function sanitize_command(text)
     return text
 end
 
-function FactionAction.CmdServerExec(faction, arg)
-    local rpid = tonumber(arg.p_id) or 0
-    local pname = tostring(arg.sender_name or "Unknown")
+-- ★ v1.9.0：改用 PlayerAction。
+-- 引擎签名：function PlayerAction.ACTIONID(player_id, faction, arg)
+-- player_id 由引擎提供，**客户端无法冒充**；原来用的 FactionAction 是从 arg 里读
+-- 客户端自填的 p_id/sender_name，任何人都能伪造成别人。
+function PlayerAction.CmdServerExec(player_id, faction, arg)
+    local rpid = tonumber(player_id) or 0
+    arg = arg or {}
+
+    -- 名字以服务端为准，不信任客户端传的 sender_name
+    local pname = "Unknown"
+    pcall(function()
+        local p = Game.GetPlayerById(rpid)
+        if p then pname = tostring(p.name or "?") end
+    end)
+
     local text = tostring(arg.txt or "")
 
     if arg.is_command then
-        local safe_text = sanitize_command(text)
-        srv_print("COMMAND", string.format("<%s>(P%d): %s", pname, rpid, safe_text))
+        srv_print("COMMAND", string.format("<%s>(P%d): %s", pname, rpid, sanitize_command(text)))
     else
         srv_print("CHAT", string.format("<%s>(P%d): %s", pname, rpid, text))
     end
 
     if arg.is_command and _G.CmdServerMod.execute_command then
-        local ok, result = _G.CmdServerMod.execute_command(text, rpid)
+        local ok, result, secret = _G.CmdServerMod.execute_command(text, rpid)
         if ok then
             -- 通知需要重新登录的玩家
             local sess = _G.CmdServerMod._sessions[rpid]
@@ -615,9 +789,12 @@ function FactionAction.CmdServerExec(faction, arg)
                     end, rpid)
                 end)
             end
-            -- RESULT 不含密码，但含账户操作信息（谁注册/谁被踢等）
-            -- 这是服务端审计日志，客户端可见但无密码风险
-            srv_print("RESULT", "To P" .. rpid .. ": " .. tostring(result))
+
+            -- ★ 机密结果绝不进入 print（print 会同步到所有客户端调试日志）。
+            -- 私密反馈仍然走 Action.RunUI —— 它只在发起该 action 的那个玩家的 UI 上下文执行。
+            if secret ~= SECRET then
+                srv_print("RESULT", "To P" .. rpid .. ": " .. tostring(result))
+            end
             pcall(function()
                 Action.RunUI(function(pid, res)
                     if Chat and Chat.Text then
@@ -629,6 +806,14 @@ function FactionAction.CmdServerExec(faction, arg)
     end
 end
 
+-- 注意：**不能**再注册一个同名的 FactionAction.CmdServerExec 做兼容。
+-- 引擎的 action 名是全局唯一的（同名重复注册会抛 "An action 'CmdServerExec' is already
+-- registered"，而且这个错误会中断整个 chunk —— 后面的 MapMsg.OnTick 就永远不会被定义）。
+-- 旧客户端用 Action.SendForLocalFaction("CmdServerExec") 时，引擎会自己报类型不匹配：
+--   [Action] Received LUA action 'CmdServerExec' of type FactionAction but registered action is type PlayerAction
+
+srv_print("CmdServerMod", "Data Layer Ready v" .. version)
+
 ---------------------------------------------------------------------------
 -- 10. 定时器：心跳 + 加入/离开 + 自动登出
 ---------------------------------------------------------------------------
@@ -637,29 +822,7 @@ _G.CmdServerMod._known_players = _G.CmdServerMod._known_players or {}
 function MapMsg.OnTick()
     -- 首次 Tick 执行初始化（Map.GetSave 在加载阶段不可用）
     if not _G.CmdServerMod._init_done then
-        _G.CmdServerMod._init_done = true
-        -- 内联初始化（避免 local function 在 OnTick 上下文中不可见）
-        local ms = get_ms()
-        if ms.setup_key == "" then
-            ms.setup_key = random_str(12)
-            srv_print("SYSTEM", "========================================")
-            srv_print("SYSTEM", "INITIAL SETUP KEY: " .. ms.setup_key)
-            srv_print("SYSTEM", "Use this key with /register to become SuperAdmin")
-            srv_print("SYSTEM", "========================================")
-        else
-            srv_print("SYSTEM", "Setup key loaded (use /setupkey show to view)")
-        end
-        -- GameSettings 命令行导入
-        local ok, gs = pcall(function() return Map.GetSettings() end)
-        if ok and gs and gs.CmdServerMod_import then
-            local data = tostring(gs.CmdServerMod_import)
-            if #data > 10 then
-                local ok2, count = do_import(data, "GameSettings")
-                if ok2 then
-                    srv_print("SYSTEM", "GameSettings import: " .. count .. " accounts loaded")
-                end
-            end
-        end
+        ensure_init()
     end
 
     tick_counter = tick_counter + 1
