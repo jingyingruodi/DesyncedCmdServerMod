@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.9"
+local version = "1.9.10"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -318,12 +318,32 @@ local function collect_diag()
     add("version", function() return version end)
     add("tick", function() return Map.GetTick() end)
     add("is_simulation", function() return Map.IsSimulation() end)
-    add("net_mode", function() return Game.GetNetMode() end)
-    add("dedicated", function() return select(2, Game.GetMultiplayerSession()) end)
+    -- ★ Game.GetNetMode / Game.GetMultiplayerSession 也是 **UI 专属** API：
+    --   在 Simulation 层调用会抛 "This functionality can only be used in UI code"
+    --   并在控制台留 traceback（2026-10-07 本地专用服务器实测）。
+    --   所以不再调用 —— 在服务端它们本来也没有信息量（网络层由引擎管）。
+    add("net_apis", function() return "UI-only (skipped)" end)
     add("speed", function() return Map.GetGameSpeed() end)
     add("players", function() return #Game.GetAllPlayers() end)
     -- 命令行在 Simulation 层读不到（UI 专属 API），不再尝试 —— 否则每次都刷 traceback
     add("setupkey_set", function() return setting_str("CmdServerMod_setupkey", 4) ~= nil end)
+    add("settings_cmdserver_keys", function()
+        local ok, ms = pcall(function() return Map.GetSettings() end)
+        if not ok or type(ms) ~= "table" then return "(settings unavailable)" end
+        local found = {}
+        for k in safe_pairs(ms) do
+            if tostring(k):find("CmdServerMod", 1, true) then found[#found + 1] = tostring(k) end
+        end
+        table.sort(found)
+        return "[" .. table.concat(found, ", ") .. "]"
+    end)
+    add("settings_total", function()
+        local ok, ms = pcall(function() return Map.GetSettings() end)
+        if not ok or type(ms) ~= "table" then return "?" end
+        local n = 0
+        for _ in safe_pairs(ms) do n = n + 1 end
+        return n
+    end)
 
     -- 存档结构：只列键名与类型
     local ok, save = pcall(function() return Map.GetSave() end)
@@ -931,7 +951,23 @@ _G.CmdServerMod.execute_command = function(text, p_id)
         if ok2 then s2 = "OK（Simulation 层竟然能直接 Chat.Text）"
         else s2 = "ERR: " .. tostring(err2) end
 
-        -- 通道 U1..U4：在**发起者客户端**的 UI 上下文里执行
+        -- 通道 U1..U4：在**发起者客户端**的 UI 上下文里执行。
+        -- ★ Action.RunUI 只能在动作执行期间调用，否则引擎报
+        --   "This functionality can only be used from inside an action function"
+        --   并留 traceback（2026-10-07 本地实测）。所以先检查上下文。
+        if not _G.CmdServerMod._in_action then
+            return true, table.concat({
+                "探针已发出（仅 Simulation 层），标记 tag = " .. tag,
+                "",
+                "⚠️ UI 层探针被跳过：当前不在动作上下文里。",
+                "  Action.RunUI 要求「正在执行某个动作」，而这条指令是从 OnTick",
+                "  或自动脚本里调用的 —— 引擎会直接报错。",
+                "  请由玩家在游戏内敲 /probe " .. tag .. " 来跑完整矩阵。",
+                "",
+                "Simulation 层直接 Chat.Text：" .. tostring(s2),
+            }, "\n")
+        end
+
         local ui_ok, ui_err = pcall(function()
             Action.RunUI(function(t, sid, oid)
                 if _G.CmdServerProbeUI then
@@ -1110,7 +1146,8 @@ end
 --   * **其它一切（含拼错的命令）一律不记录参数** —— 因为拼错的很可能正是 register/login。
 local SAFE_ARGS_COMMANDS = {
     help = true, ping = true, whoami = true, players = true, playerinfo = true,
-    diag = true, cmdline = true, speed = true, settings = true, kick = true, admin = true,
+    diag = true, cmdline = true, probe = true,
+    speed = true, settings = true, kick = true, admin = true,
 }
 local SECRET_ARG_COMMANDS = {
     register = true, login = true, changepass = true, account = true, setupkey = true,
@@ -1159,7 +1196,9 @@ function PlayerAction.CmdServerExec(player_id, faction, arg)
     end
 
     if arg.is_command and _G.CmdServerMod.execute_command then
+        _G.CmdServerMod._in_action = true          -- 供 /probe 判断能否 RunUI
         local ok, result, secret = _G.CmdServerMod.execute_command(text, rpid)
+        _G.CmdServerMod._in_action = false
         if ok then
             -- 通知需要重新登录的玩家
             local sess = _G.CmdServerMod._sessions[rpid]
@@ -1189,6 +1228,70 @@ function PlayerAction.CmdServerExec(player_id, faction, arg)
         end
     end
 end
+
+-- ★ 联调自动执行（autorun）
+--
+-- 动机：专用服务器**后台无法输入**，一切只能靠游戏内敲字或自动定时器。
+-- 但做自动化测试时，连"在游戏里敲字"都不方便（开场对话会抢走按键）。
+-- 于是提供一个开关：首个玩家上线时，模组替他自动跑一串指令。
+--
+-- 用法（GameSettings）：
+--   'CmdServerMod_autorun': '/register dev dev $SETUPKEY|/probe alpha'
+--   - 用 | 分隔多条指令
+--   - $SETUPKEY 会替换成当前 setup key
+--   - 每条的结果都会打到服务端控制台（[AUTORUN]），无需人工观察客户端
+--
+-- 安全性：必须显式在 GameSettings 里给出才会执行；默认完全关闭。
+-- ★ 开发期硬编码的自动脚本。正式发布必须保持 nil。
+--
+-- ⚠️ 2026-10-07 本地专用服务器实测（/diag 输出 settings_cmdserver_keys=[]）：
+--   **自定义的 GameSettings 键会被引擎丢弃**，Map.GetSettings() 只返回 26 个已知键。
+--   也就是说这类「运维从命令行注入配置」的通道在本引擎上**根本不存在**：
+--     - Game.GetCommandLineArguments()  是 UI 专属，Simulation 层抛错
+--     - -GameSettings 自定义键          被丢弃
+--     - -SetupKey=xx                    同上，无效
+--   唯一真正可用的配置入口是**游戏内指令**（外加首次引导用的控制台打印密钥）。
+--   所以本地联调改用这个常量，不再假装 GameSettings 能透传。
+local DEV_AUTORUN = nil
+
+local function run_autorun()
+    if _G.CmdServerMod._autorun_done then return end
+    -- 显式配置优先，DEV_AUTORUN 只是兜底
+    local script = setting_str("CmdServerMod_autorun", 1) or DEV_AUTORUN
+    if not script then return end
+    local players = nil
+    pcall(function() players = Game.GetAllPlayers() end)
+    if type(players) ~= "table" or #players == 0 then
+        _G.CmdServerMod._autorun_wait = 0
+        return
+    end
+    -- ★ 必须等几秒：玩家刚 JOIN 时客户端 UI 还没就绪，
+    --   此时发 UI 层探针会石沉大海（2026-10-07 实测：第一次跑探针时 Join 还没完成）。
+    local waited = (_G.CmdServerMod._autorun_wait or 0) + 1
+    _G.CmdServerMod._autorun_wait = waited
+    if waited < 25 then return end   -- 25 tick ≈ 5 秒
+    _G.CmdServerMod._autorun_done = true
+
+    local target = players[1].id
+    local key = ""
+    pcall(function() key = get_ms().setup_key or "" end)
+
+    srv_print("AUTORUN", string.format("开始为 P%s 自动执行 %d 条指令", tostring(target),
+        select(2, script:gsub("|", "|")) + 1))
+    for one in script:gmatch("[^|]+") do
+        one = one:gsub("^%s+", ""):gsub("%s+$", "")
+        if one ~= "" then
+            local expanded = one:gsub("%$SETUPKEY", (key:gsub("%%", "%%%%")))
+            local ok, result = false, "?"
+            pcall(function() ok, result = _G.CmdServerMod.execute_command(expanded, target) end)
+            local shown = tostring(result):gsub("\n", " / ")
+            srv_print("AUTORUN", string.format("P%s > %s\n    => %s", tostring(target),
+                sanitize_command(expanded), shown))
+        end
+    end
+    srv_print("AUTORUN", "自动执行结束")
+end
+_G.CmdServerMod._run_autorun = run_autorun
 
 -- ★ 探针回执：客户端 UI 层收到探针后主动回报，汇总到服务端控制台。
 -- 客户端没有可读日志文件，所以让每个客户端自己报告「我收到了什么」。
@@ -1220,6 +1323,11 @@ local function on_tick_impl()
     end
 
     tick_counter = tick_counter + 1
+
+    -- 联调自动执行（需 GameSettings 显式给出 CmdServerMod_autorun）
+    if not _G.CmdServerMod._autorun_done and _G.CmdServerMod._run_autorun then
+        _G.CmdServerMod._run_autorun()
+    end
 
     -- 每秒检测玩家加入/离开 + 自动登出
     if tick_counter % PRESENCE_CHECK_TICKS == 0 then

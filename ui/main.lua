@@ -9,7 +9,7 @@
 
 if not UI or not UI.Run then return end
 
-local version = "1.9.9"
+local version = "1.9.10"
 print("[CmdServerMod-UI] v" .. version .. " link deployed.")
 
 ---------------------------------------------------------------------------
@@ -72,6 +72,34 @@ UI.SendChatGlobal = function(msg_type, arg)
     if original_send_chat then
         return original_send_chat(msg_type, arg)
     end
+end
+
+---------------------------------------------------------------------------
+-- ★ 联调用：客户端侧自动以「玩家身份」发一条指令。正式发布必须保持 nil。
+--
+-- 为什么必须在客户端发：
+--   Action.RunUI 要求「正在执行的动作」上下文（文档：Must be called while executing
+--   an action）。服务端 MapMsg.OnTick 里没有该上下文 —— 实测确认 RunUI 会静默失效，
+--   于是所有 UI 层探针都发不出去。只有玩家动作能建立这个上下文。
+--   而本机自动化又敲不进游戏聊天框（xdotool 在 Connect 对话框里能用，聊天框里不行），
+--   所以干脆让客户端的模组自己发。
+--
+-- 会周期性地发若干次，覆盖「前端加载 → 连上服务器」这段窗口。
+local DEV_AUTOCMD = nil          -- 例："/probe alpha"
+local DEV_AUTOCMD_TIMES = 120    -- 最多发几次（覆盖到服务端注册完成之后）
+local DEV_AUTOCMD_EVERY = 8      -- 每次间隔秒数
+
+if DEV_AUTOCMD and UI and UI.Delay then
+    local left = DEV_AUTOCMD_TIMES
+    local function fire()
+        left = left - 1
+        if left < 0 then return end
+        pcall(function()
+            Action.SendFromPlayer("CmdServerExec", { txt = DEV_AUTOCMD, is_command = true })
+        end)
+        UI.Delay(DEV_AUTOCMD_EVERY, fire)
+    end
+    UI.Delay(15, fire)
 end
 
 ---------------------------------------------------------------------------
