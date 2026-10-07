@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.7"
+local version = "1.9.8"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -996,24 +996,39 @@ end
 ---------------------------------------------------------------------------
 -- 9. Action 处理器
 ---------------------------------------------------------------------------
--- 密码脱敏：隐藏 register/login/changepass 中的密码参数
+-- 指令日志脱敏（★ 改成「失败关闭」策略）
+--
+-- 教训（2026-10-07 真实服务器上发生）：原来的实现用**精确命令名**匹配来脱敏，
+-- 玩家把 /register 打成 /rgister，于是参数完全没被处理：
+--     [COMMAND] <镜影若滴>(P1): /rgister 223345lp 223345lp b8Vd8YpfT4ZR
+-- 明文密码就这样进了服务端控制台，并被 print 同步到所有在线客户端的调试日志。
+-- 靠枚举「要脱敏的命令名」是防不住的 —— 打错一个字就漏。
+--
+-- 新策略：
+--   * 只有明确列在 SAFE_ARGS 里的命令才原样记录参数；
+--   * 已知的敏感命令只记录命令名与参数个数；
+--   * **其它一切（含拼错的命令）一律不记录参数** —— 因为拼错的很可能正是 register/login。
+local SAFE_ARGS_COMMANDS = {
+    help = true, ping = true, whoami = true, players = true, playerinfo = true,
+    diag = true, cmdline = true, speed = true, settings = true, kick = true, admin = true,
+}
+local SECRET_ARG_COMMANDS = {
+    register = true, login = true, changepass = true, account = true, setupkey = true,
+}
+
 local function sanitize_command(text)
-    if not text or text:sub(1, 1) ~= "/" then return text end
-    local cmd_line = text:sub(2)
+    if type(text) ~= "string" or text:sub(1, 1) ~= "/" then return text end
     local parts = {}
-    for part in cmd_line:gmatch("%S+") do table.insert(parts, part) end
+    for part in text:sub(2):gmatch("%S+") do table.insert(parts, part) end
     if #parts == 0 then return text end
     local cmd = parts[1]:lower()
-    if cmd == "register" then
-        if #parts >= 4 then return "/register *** *** " .. table.concat(parts, " ", 4)
-        elseif #parts >= 3 then return "/register *** ***"
-        else return "/register ***" end
-    elseif cmd == "login" then
-        return "/login ***"
-    elseif cmd == "changepass" then
-        return "/changepass *** ***"
+    local argc = #parts - 1
+    if argc == 0 then return "/" .. parts[1] end
+    if SAFE_ARGS_COMMANDS[cmd] then return text end
+    if SECRET_ARG_COMMANDS[cmd] then
+        return "/" .. parts[1] .. " (" .. argc .. " args hidden)"
     end
-    return text
+    return "/" .. parts[1] .. " (" .. argc .. " args hidden, unknown command)"
 end
 
 -- ★ v1.9.0：改用 PlayerAction。
