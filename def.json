@@ -2,8 +2,8 @@
     "id": "CmdServerMod",
     "name": "Command Console",
     "author": "镜影若滴",
-    "version_name": "1.9.5",
-    "version_code": 23,
+    "version_name": "1.9.6",
+    "version_code": 24,
     "description": "Powerful server-side command console and management mod. Support headless server logging and command feedback.",
 
     "packages": {

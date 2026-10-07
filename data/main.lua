@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.5"
+local version = "1.9.6"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -267,6 +267,13 @@ end
 -- 触发方式：
 --   * 服务器命令行带 -CmdServerMod_Diag  → 首个 OnTick 自动打印一次
 --   * 游戏内 /diag（仅超管）
+-- 服务器命令行（**脱敏**：命令行里可能带 -SetupKey=<密钥>）
+local function cmdline_sanitized()
+    local ok, a = pcall(function() return Game.GetCommandLineArguments() end)
+    if not ok or type(a) ~= "string" then return "(unavailable)" end
+    return (a:gsub("[%-/][Ss]etup[Kk]ey=%S+", "-SetupKey=***"))
+end
+
 local function collect_diag()
     local lines = {}
     local function add(k, fn)
@@ -281,11 +288,7 @@ local function collect_diag()
     add("speed", function() return Map.GetGameSpeed() end)
     add("players", function() return #Game.GetAllPlayers() end)
     -- ★ 必须脱敏：命令行里可能带 -SetupKey=<密钥>，而诊断输出会进服务端控制台
-    add("args", function()
-        local a = tostring(Game.GetCommandLineArguments())
-        a = a:gsub("[%-/][Ss]etup[Kk]ey=%S+", "-SetupKey=***")
-        return a
-    end)
+    add("args", cmdline_sanitized)
 
     -- 存档结构：只列键名与类型
     local ok, save = pcall(function() return Map.GetSave() end)
@@ -804,6 +807,7 @@ _G.CmdServerMod.execute_command = function(text, p_id)
             lines[#lines + 1] = "/setupkey show|regen"
             lines[#lines + 1] = "/playerinfo [id] (debug)"
             lines[#lines + 1] = "/players (debug)"
+            lines[#lines + 1] = "/cmdline (server command line)"
             lines[#lines + 1] = "/diag (engine/save diagnostics)"
         end
         return true, table.concat(lines, "\n")
@@ -853,6 +857,15 @@ _G.CmdServerMod.execute_command = function(text, p_id)
     elseif cmd == "players" then
         if not rank_at_least(p_id, "superadmin") then return true, "Access denied." end
         return true, _G.CmdServerMod._dump_all_players()
+
+    elseif cmd == "cmdline" then
+        -- 交接包里列出的诊断指令之一（会话里出现过），v1.8.0 未实现
+        if not rank_at_least(p_id, "superadmin") then return true, "Access denied." end
+        local text = "Server command line:\n" .. cmdline_sanitized()
+        pcall(function()
+            srv_print("CMDLINE", "requested by P" .. tostring(p_id) .. " | " .. cmdline_sanitized())
+        end)
+        return true, text
 
     elseif cmd == "diag" then
         -- 运行期诊断：确认引擎行为（存档表语义、净模式、tick 等）。

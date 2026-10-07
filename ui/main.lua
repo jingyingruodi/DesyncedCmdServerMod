@@ -9,7 +9,7 @@
 
 if not UI or not UI.Run then return end
 
-local version = "1.9.5"
+local version = "1.9.6"
 print("[CmdServerMod-UI] v" .. version .. " link deployed.")
 
 ---------------------------------------------------------------------------
