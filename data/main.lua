@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.2"
+local version = "1.9.3"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -260,7 +260,71 @@ local function do_import(encoded, source)
 end
 
 ---------------------------------------------------------------------------
--- 3.5 幂等初始化（必须在游戏已开始之后调用；Map.GetSave 在此之前不可用）
+-- 3.5 运行期诊断（用于在真实服务器上确认引擎行为）
+---------------------------------------------------------------------------
+-- 输出**只含结构与计数，绝不含任何值**（账号哈希、setup key 都不会出现），
+-- 因此可以安全地进服务端控制台（那份日志会同步到所有客户端调试日志）。
+-- 触发方式：
+--   * 服务器命令行带 -CmdServerMod_Diag  → 首个 OnTick 自动打印一次
+--   * 游戏内 /diag（仅超管）
+local function collect_diag()
+    local lines = {}
+    local function add(k, fn)
+        local ok, v = pcall(fn)
+        lines[#lines + 1] = k .. "=" .. (ok and tostring(v) or ("ERR:" .. tostring(v)))
+    end
+    add("version", function() return version end)
+    add("tick", function() return Map.GetTick() end)
+    add("is_simulation", function() return Map.IsSimulation() end)
+    add("net_mode", function() return Game.GetNetMode() end)
+    add("dedicated", function() return select(2, Game.GetMultiplayerSession()) end)
+    add("speed", function() return Map.GetGameSpeed() end)
+    add("players", function() return #Game.GetAllPlayers() end)
+    add("args", function() return Game.GetCommandLineArguments() end)
+
+    -- 存档结构：只列键名与类型
+    local ok, save = pcall(function() return Map.GetSave() end)
+    if not ok then
+        lines[#lines + 1] = "GetSave=ERR:" .. tostring(save)
+        return lines
+    end
+    if type(save) ~= "table" then
+        lines[#lines + 1] = "GetSave=type(" .. type(save) .. ")"
+        return lines
+    end
+    local ks, n_accounts, has_key = {}, 0, false
+    -- 注意：不要用 pcall 去包 pairs —— pcall 只保留第一个返回值，
+    -- 泛型 for 会拿到 (next, nil) 从而报 "table expected, got nil"。
+    -- safe_pairs 对 table 原样返回 pairs 的三个值，对非 table 返回空迭代器。
+    for k, v in safe_pairs(save) do ks[#ks + 1] = tostring(k) .. ":" .. type(v) end
+    table.sort(ks)
+    if type(save.accounts) == "table" then
+        for _ in safe_pairs(save.accounts) do n_accounts = n_accounts + 1 end
+    end
+    if type(save.setup_key) == "string" and #save.setup_key > 0 then has_key = true end
+    lines[#lines + 1] = "save_keys=[" .. table.concat(ks, ", ") .. "]"
+    lines[#lines + 1] = "accounts=" .. n_accounts
+    lines[#lines + 1] = "setup_key_present=" .. tostring(has_key)
+    -- v1.8.0 曾把数据写在 save.CmdServerMod 下；如果它还在，说明**嵌套表确实被持久化了**
+    if type(save.CmdServerMod) == "table" then
+        local ks2 = {}
+        for k, v in safe_pairs(save.CmdServerMod) do
+            ks2[#ks2 + 1] = tostring(k) .. ":" .. type(v)
+        end
+        table.sort(ks2)
+        lines[#lines + 1] = "LEGACY_nested_keys=[" .. table.concat(ks2, ", ") .. "]"
+    end
+    return lines
+end
+_G.CmdServerMod._collect_diag = collect_diag
+
+local function diag_requested()
+    local ok, args = pcall(function() return Game.GetCommandLineArguments() end)
+    return ok and type(args) == "string" and args:find("CmdServerMod_Diag", 1, true) ~= nil
+end
+
+---------------------------------------------------------------------------
+-- 3.6 幂等初始化（必须在游戏已开始之后调用；Map.GetSave 在此之前不可用）
 ---------------------------------------------------------------------------
 -- 既从 MapMsg.OnTick 调用，也从指令入口调用 —— 因为游戏暂停/无人连接时 OnTick 不触发，
 -- 而 setup key 只在初始化时生成，否则 /register 会永远返回「Server initializing」，
@@ -309,6 +373,12 @@ local function ensure_init()
         return false
     end
     _G.CmdServerMod._init_done = true
+
+    -- 命令行要求诊断时，在首个 tick 自动打印一次运行期事实（只含结构，无值）
+    if diag_requested() and not _G.CmdServerMod._diag_done then
+        _G.CmdServerMod._diag_done = true
+        pcall(function() srv_print("DIAG", table.concat(collect_diag(), " | ")) end)
+    end
     return true
 end
 
@@ -691,6 +761,7 @@ _G.CmdServerMod.execute_command = function(text, p_id)
             lines[#lines + 1] = "/setupkey show|regen"
             lines[#lines + 1] = "/playerinfo [id] (debug)"
             lines[#lines + 1] = "/players (debug)"
+            lines[#lines + 1] = "/diag (engine/save diagnostics)"
         end
         return true, table.concat(lines, "\n")
 
@@ -740,6 +811,18 @@ _G.CmdServerMod.execute_command = function(text, p_id)
         if not rank_at_least(p_id, "superadmin") then return true, "Access denied." end
         return true, _G.CmdServerMod._dump_all_players()
 
+    elseif cmd == "diag" then
+        -- 运行期诊断：确认引擎行为（存档表语义、净模式、tick 等）。
+        -- 输出只含结构与计数，不含任何机密，所以也可以安全进服务端控制台。
+        if not rank_at_least(p_id, "superadmin") then return true, "Access denied." end
+        local ok, lines = pcall(collect_diag)
+        local text
+        if ok then text = table.concat(lines, "\n")
+        else text = "diag failed: " .. tostring(lines) end
+        pcall(function() srv_print("DIAG", "requested by P" .. tostring(p_id) .. " | " ..
+            table.concat(ok and lines or { tostring(lines) }, " | ")) end)
+        return true, text
+
     else
         return true, "Unknown: /" .. cmd .. ". Try /help"
     end
@@ -764,13 +847,16 @@ local function player_summary(p)
             lines[#lines + 1] = "  " .. k .. " = " .. tostring(v)
         end
     end
+    -- 引擎对象可能是 userdata，甚至可能是带 __pairs 元方法且会抛错的表，
+    -- 所以这里把**整个遍历**包进 pcall，而不是只包 pairs 本身。
     if type(p) == "table" then
-        local ok, iter = pcall(function() return pairs(p) end)
-        if ok and iter then
-            for k, v in iter do
-                if not seen[k] then lines[#lines + 1] = "  " .. tostring(k) .. " = " .. tostring(v) end
+        pcall(function()
+            for k, v in pairs(p) do
+                if not seen[k] then
+                    lines[#lines + 1] = "  " .. tostring(k) .. " = " .. tostring(v)
+                end
             end
-        end
+        end)
     end
     if #lines == 0 then
         lines[1] = "  (无可读字段；对象类型 = " .. type(p) .. ")"
@@ -784,11 +870,8 @@ local function table_dump(tbl, indent)
     if type(tbl) ~= "table" then return prefix .. tostring(tbl) end
     if indent > 3 then return prefix .. "(...)" end
     local lines = {}
-    local ok, iter = pcall(function() return pairs(tbl) end)
-    if not ok or not iter then
-        return prefix .. "(不可遍历，类型 = " .. type(tbl) .. ")"
-    end
-    for k, v in iter do
+    -- 同样要用 safe_pairs：不能用 pcall 包装 pairs（会丢掉 state 与 control）
+    for k, v in safe_pairs(tbl) do
         local vt = type(v)
         if vt == "table" then
             lines[#lines + 1] = prefix .. tostring(k) .. ": {"
