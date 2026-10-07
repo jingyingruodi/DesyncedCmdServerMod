@@ -334,7 +334,7 @@ end
 -- 现场调试开关：true 时，每个服务器进程在首个 tick 自动打印一次 collect_diag()。
 -- 只在「需要抓现场数据」的阶段临时打开，**正式发布应保持 false**
 -- （输出本身无害：只有结构、计数和命令行，不含任何机密）。
-local STARTUP_DIAG = true   -- ★ 现场诊断构建：抓完数据后必须改回 false
+local STARTUP_DIAG = false  -- 曾临时置 true 用于现场取证；/diag 与 -CmdServerMod_Diag 仍可用
 
 -- 是否要自动打印：命令行开关 -CmdServerMod_Diag，或上面的现场调试开关
 local function diag_auto_enabled()
