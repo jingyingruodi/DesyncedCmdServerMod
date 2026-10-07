@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.3"
+local version = "1.9.4"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -280,7 +280,12 @@ local function collect_diag()
     add("dedicated", function() return select(2, Game.GetMultiplayerSession()) end)
     add("speed", function() return Map.GetGameSpeed() end)
     add("players", function() return #Game.GetAllPlayers() end)
-    add("args", function() return Game.GetCommandLineArguments() end)
+    -- ★ 必须脱敏：命令行里可能带 -SetupKey=<密钥>，而诊断输出会进服务端控制台
+    add("args", function()
+        local a = tostring(Game.GetCommandLineArguments())
+        a = a:gsub("[%-/][Ss]etup[Kk]ey=%S+", "-SetupKey=***")
+        return a
+    end)
 
     -- 存档结构：只列键名与类型
     local ok, save = pcall(function() return Map.GetSave() end)
@@ -321,6 +326,16 @@ _G.CmdServerMod._collect_diag = collect_diag
 local function diag_requested()
     local ok, args = pcall(function() return Game.GetCommandLineArguments() end)
     return ok and type(args) == "string" and args:find("CmdServerMod_Diag", 1, true) ~= nil
+end
+
+-- 现场调试开关：true 时，每个服务器进程在首个 tick 自动打印一次 collect_diag()。
+-- 只在「需要抓现场数据」的阶段临时打开，**正式发布应保持 false**
+-- （输出本身无害：只有结构、计数和命令行，不含任何机密）。
+local STARTUP_DIAG = true   -- ★ 现场诊断构建：抓完数据后必须改回 false
+
+-- 是否要自动打印：命令行开关 -CmdServerMod_Diag，或上面的现场调试开关
+local function diag_auto_enabled()
+    return STARTUP_DIAG or diag_requested()
 end
 
 ---------------------------------------------------------------------------
@@ -375,7 +390,7 @@ local function ensure_init()
     _G.CmdServerMod._init_done = true
 
     -- 命令行要求诊断时，在首个 tick 自动打印一次运行期事实（只含结构，无值）
-    if diag_requested() and not _G.CmdServerMod._diag_done then
+    if diag_auto_enabled() and not _G.CmdServerMod._diag_done then
         _G.CmdServerMod._diag_done = true
         pcall(function() srv_print("DIAG", table.concat(collect_diag(), " | ")) end)
     end
