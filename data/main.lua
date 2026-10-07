@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.8"
+local version = "1.9.9"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -842,6 +842,7 @@ _G.CmdServerMod.execute_command = function(text, p_id)
             lines[#lines + 1] = "/setupkey show|regen"
             lines[#lines + 1] = "/playerinfo [id] (debug)"
             lines[#lines + 1] = "/players (debug)"
+            lines[#lines + 1] = "/probe [tag] (channel visibility probe)"
             lines[#lines + 1] = "/cmdline (server command line)"
             lines[#lines + 1] = "/diag (engine/save diagnostics)"
         end
@@ -892,6 +893,105 @@ _G.CmdServerMod.execute_command = function(text, p_id)
     elseif cmd == "players" then
         if not rank_at_least(p_id, "superadmin") then return true, "Access denied." end
         return true, _G.CmdServerMod._dump_all_players()
+
+    elseif cmd == "probe" then
+        ---------------------------------------------------------------------------
+        -- /probe [标记] —— 通道可见性探针（仅超管）
+        --
+        -- 动机：服务器后台无法输入，所以探查只能靠模组自己发信号再对照观察。
+        -- 每条通道用不同的可搜索前缀，跑一次就能确定「谁能看到什么」。
+        ---------------------------------------------------------------------------
+        if not rank_at_least(p_id, "superadmin") then return true, "Access denied." end
+
+        local tag = parts[2]
+        if not tag or tag == "" then
+            _G.CmdServerMod._probe_n = (_G.CmdServerMod._probe_n or 0) + 1
+            tag = "auto" .. tostring(_G.CmdServerMod._probe_n)
+        end
+        tag = tag:gsub("[^%w_%-]", "")   -- 只留安全字符，方便 grep
+        if tag == "" then tag = "empty" end
+
+        -- 找另一个在线玩家（用于 U4 定向探针）
+        local other_id, other_name = nil, "(none)"
+        pcall(function()
+            for _, pl in ipairs(Game.GetAllPlayers()) do
+                if pl.id ~= p_id then other_id = pl.id; other_name = pl.name; break end
+            end
+        end)
+
+        -- 通道 S1：Simulation 层 print
+        -- 预期：服务端控制台 + **所有客户端**调试日志（2026-10-07 实测确认）
+        srv_print("PROBE", "[PROBE:sim-print] " .. tag .. " | requested by P" .. tostring(p_id))
+
+        -- 通道 S2：Simulation 层能不能直接私聊？（预期：不行，Chat 是 UI 层 API）
+        local s2 = "not attempted"
+        local ok2, err2 = pcall(function()
+            Chat.Text({ txt = "[PROBE:sim-chat] " .. tag, player_id = p_id }, p_id)
+        end)
+        if ok2 then s2 = "OK（Simulation 层竟然能直接 Chat.Text）"
+        else s2 = "ERR: " .. tostring(err2) end
+
+        -- 通道 U1..U4：在**发起者客户端**的 UI 上下文里执行
+        local ui_ok, ui_err = pcall(function()
+            Action.RunUI(function(t, sid, oid)
+                if _G.CmdServerProbeUI then
+                    _G.CmdServerProbeUI(t, sid, oid)
+                else
+                    print("[PROBE:ui-missing] " .. tostring(t) ..
+                          " —— UI 层未加载探针函数（模组版本不一致？）")
+                end
+            end, tag, p_id, other_id)
+        end)
+
+        -- ★ 自回执通道：用我们自己的聊天类型 CmdServerProbe 广播/定向，
+        -- 由每个客户端的 UI VM 执行并回报 —— 结果直接出现在**服务端控制台**，
+        -- 不需要去翻任何客户端日志。
+        local dispatched = {}
+        -- 注意：pcall 里的匿名函数不是变参函数，不能直接用 ...，所以打包成表传
+        local function ui_probe(fn, args)
+            local ok, err = pcall(function()
+                Action.RunUI(fn, table.unpack(args or {}))
+            end)
+            dispatched[#dispatched + 1] = ok and "ok" or ("ERR:" .. tostring(err))
+            return ok
+        end
+        ui_probe(function(t)
+            if UI and UI.SendChatGlobal then
+                UI.SendChatGlobal("CmdServerProbe", { tag = t, channel = "global" })
+            end
+        end, { tag })
+        ui_probe(function(t, oid)
+            if UI and UI.SendChatPlayer and oid then
+                UI.SendChatPlayer("CmdServerProbe", oid, { tag = t, channel = "directed" })
+            end
+        end, { tag, other_id })
+
+        local lines = {
+            "探针已发出，标记 tag = " .. tag,
+            "对方玩家 = " .. tostring(other_name) .. (other_id and (" (P" .. other_id .. ")") or ""),
+            "",
+            "请对照以下 5 处，看哪些标签出现了：",
+            "  [PROBE:sim-print]        Simulation 层 print",
+            "  [PROBE:ui-print]         UI 层 print",
+            "  [PROBE:ui-chat-self]     只私聊给发起者",
+            "  [PROBE:ui-chat-global]   全服广播",
+            "  [PROBE:ui-chat-other]    定向发给对方",
+            "",
+            "观察位置：服务端控制台 / 你客户端日志 / 对方客户端日志 /",
+            "          你的聊天栏 / 对方的聊天栏",
+            "",
+            "预期（待验证）：sim-print 只进日志不进聊天栏且全客户端可见；",
+            "                ui-chat-self 只你自己可见；ui-chat-global 所有人可见；",
+            "                ui-chat-other 只有对方可见。",
+            "",
+            "★ 看服务端控制台里的 [PROBE-REPORT] 行即可知道谁收到了哪条：",
+            "   channel=global    → 应当所有客户端都回报",
+            "   channel=directed  → 应当只有对方客户端回报",
+            "",
+            "Simulation 层直接 Chat.Text：" .. tostring(s2),
+            "UI 层探针调用：" .. (ui_ok and "已派发" or ("失败: " .. tostring(ui_err))),
+        }
+        return true, table.concat(lines, "\n")
 
     elseif cmd == "cmdline" then
         -- 交接包里列出的诊断指令之一（会话里出现过），v1.8.0 未实现
@@ -1088,6 +1188,16 @@ function PlayerAction.CmdServerExec(player_id, faction, arg)
             end)
         end
     end
+end
+
+-- ★ 探针回执：客户端 UI 层收到探针后主动回报，汇总到服务端控制台。
+-- 客户端没有可读日志文件，所以让每个客户端自己报告「我收到了什么」。
+function PlayerAction.CmdServerProbeReport(player_id, faction, arg)
+    if type(arg) ~= "table" then return end
+    srv_print("PROBE-REPORT", string.format(
+        "P%s 收到 channel=%s tag=%s (来源P%s)",
+        tostring(arg.me or player_id), tostring(arg.channel),
+        tostring(arg.tag), tostring(arg.sender)))
 end
 
 -- 注意：**不能**再注册一个同名的 FactionAction.CmdServerExec 做兼容。

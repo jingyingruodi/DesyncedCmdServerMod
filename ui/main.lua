@@ -9,7 +9,7 @@
 
 if not UI or not UI.Run then return end
 
-local version = "1.9.8"
+local version = "1.9.9"
 print("[CmdServerMod-UI] v" .. version .. " link deployed.")
 
 ---------------------------------------------------------------------------
@@ -72,4 +72,90 @@ UI.SendChatGlobal = function(msg_type, arg)
     if original_send_chat then
         return original_send_chat(msg_type, arg)
     end
+end
+
+---------------------------------------------------------------------------
+-- 探针回执（★ 核心机制）
+--
+-- 问题：客户端没有可读的日志文件（UE shipping 构建不写 .log），stdout 也被
+--       Steam/Proton 丢进 /dev/null。所以「另一个客户端看到了什么」无法直接观察。
+--
+-- 解法：注册一个**我们自己的聊天类型** Chat.CmdServerProbe。服务端发起探针时
+--       通过 UI.SendChatGlobal / SendChatPlayer 调用它 —— 引擎会在**目标客户端的
+--       UI VM 里**执行这个函数。于是每个客户端可以主动把「我收到了」发回服务端
+--       （Action.SendFromPlayer，身份由引擎注入），全部结果汇总到**服务端控制台**，
+--       一处即可看到完整可见性矩阵，不需要去翻任何客户端的日志。
+---------------------------------------------------------------------------
+Chat.CmdServerProbe = function(arg, sender, scope)
+    if type(arg) ~= "table" then return end
+    local me = -1
+    pcall(function() me = Game.GetLocalPlayerId() end)
+    local tag = tostring(arg.tag or "?")
+    local ch  = tostring(arg.channel or "?")
+
+    -- UI 层 print：只应出现在本客户端与该客户端 ID 对应的日志里
+    pcall(print, string.format("[PROBE:recv] ch=%s tag=%s me=%s", ch, tag, tostring(me)))
+
+    -- 在本地聊天栏显示一条（用于验证聊天栏可见性）
+    pcall(function()
+        if Chat and Chat.Text then
+            Chat.Text({ txt = string.format("[PROBE:chatbar] ch=%s tag=%s", ch, tag),
+                        player_id = me }, me)
+        end
+    end)
+
+    -- ★ 回报服务端：谁收到了哪条探针
+    pcall(function()
+        Action.SendFromPlayer("CmdServerProbeReport", {
+            channel = ch, tag = tag, me = me,
+            sender = sender, scope = tostring(scope),
+        })
+    end)
+end
+
+---------------------------------------------------------------------------
+-- 探针（Probe）：测定「哪一条通道能被谁看到」
+--
+-- 由 Data 层经 Action.RunUI 调用。触发方式是游戏内超管指令：
+--     /probe <标记>
+-- 每个通道用不同的可搜索前缀发一条消息，然后把
+--   【服务端控制台 / 客户端A日志 / 客户端B日志 / 客户端A聊天栏 / 客户端B聊天栏】
+-- 五处的实际出现情况记下来，就能确定每种通道的可见范围。
+--
+-- ⚠️ 本函数会被 dump/load 到 UI VM 里执行，只能依赖全局，不能依赖 Data 层 upvalue。
+-- ⚠️ 全局广播必须用 **original_send_chat**（被 hook 之前的原函数）：
+--    我们的 UI.SendChatGlobal 钩子会把 "Text" 消息转成玩家动作发给服务端，
+--    用它会把探针消息当成玩家发言、反而广播不出去。
+---------------------------------------------------------------------------
+_G.CmdServerProbeUI = function(tag, self_id, other_id)
+    tag = tostring(tag)
+
+    -- 通道 U1：UI 层 print（预期：只进本客户端日志）
+    pcall(print, "[PROBE:ui-print] " .. tag)
+
+    -- 通道 U2：私聊给自己（预期：只有自己聊天栏 + 自己日志）
+    pcall(function()
+        if Chat and Chat.Text then
+            Chat.Text({ txt = "[PROBE:ui-chat-self] " .. tag, player_id = self_id }, self_id)
+        end
+    end)
+
+    -- 通道 U3：全局广播（预期：所有人聊天栏 + 所有人日志）
+    pcall(function()
+        local send = original_send_chat or (UI and UI.SendChatGlobal)
+        if send then
+            send("Text", { txt = "[PROBE:ui-chat-global] " .. tag })
+        end
+    end)
+
+    -- 通道 U4：只发给另一个玩家（预期：只有对方聊天栏 + 对方日志）
+    if other_id then
+        pcall(function()
+            if UI and UI.SendChatPlayer then
+                UI.SendChatPlayer("Text", other_id, { txt = "[PROBE:ui-chat-other] " .. tag })
+            end
+        end)
+    end
+
+    pcall(print, "[PROBE:ui-done] " .. tag)
 end
