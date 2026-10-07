@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.9.1"
+local version = "1.9.2"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -912,7 +912,7 @@ srv_print("CmdServerMod", "Data Layer Ready v" .. version)
 ---------------------------------------------------------------------------
 _G.CmdServerMod._known_players = _G.CmdServerMod._known_players or {}
 
-function MapMsg.OnTick()
+local function on_tick_impl()
     -- 首次 Tick 执行初始化（Map.GetSave 在加载阶段不可用）
     if not _G.CmdServerMod._init_done then
         ensure_init()
@@ -1000,7 +1000,27 @@ function MapMsg.OnTick()
     end
 end
 
+---------------------------------------------------------------------------
+-- 11. 顶层兜底
+---------------------------------------------------------------------------
+-- ★ 教训（2026-10-07 云端实测）：模组在 package:init() 里抛一个错，
+-- 竟然会让**存档加载失败、专用服务器直接退出**：
+--   Critical error while executing CmdServerMod/data/main.lua:1021 ...
+--   [BOOT] Failed to load save game from command line (Error code: 7)
+--   [SERVER] Failed to start up dedicated server, shutting down
+-- 所以本模组不注册 package:init()（只用 OnTick），并且把 OnTick 整体包进 pcall ——
+-- 任何一行出错都只应影响本模组，绝不能影响引擎。
+local tick_errors = 0
 
+function MapMsg.OnTick()
+    local ok, err = pcall(on_tick_impl)
+    if not ok then
+        tick_errors = tick_errors + 1
+        -- 限流：前 5 次 + 之后每 5 分钟一次，避免刷爆控制台
+        if tick_errors <= 5 or tick_errors % (300 * TICKS_PER_SECOND) == 0 then
+            srv_print("ERROR", string.format("OnTick 第 %d 次失败: %s", tick_errors, tostring(err)))
+        end
+    end
+end
 
-
-
+_G.CmdServerMod._tick_errors = function() return tick_errors end
