@@ -9,28 +9,41 @@
 
 if not UI or not UI.Run then return end
 
-local version = "1.10.0"
+local version = "1.10.1"
 print("[CmdServerMod-UI] v" .. version .. " link deployed.")
 
 ---------------------------------------------------------------------------
 -- 与 Data 层一致的脱敏逻辑：密码参数绝不出现在任何日志里
 ---------------------------------------------------------------------------
+-- 指令脱敏：**失败关闭**（与 Data 层保持同一策略）
+--
+-- 教训（2026-10-07）：原来靠精确命令名匹配，玩家把 /register 打成 /rgister
+-- 就完全绕过，明文密码进了日志。靠枚举「要脱敏的命令名」是防不住的。
+-- 本层只是把玩家自己输入的命令写进**本客户端**的日志（不广播），
+-- 但同样是密码落盘，必须一视同仁地挡住。
+local SAFE_ARGS_COMMANDS = {
+    help = true, ping = true, whoami = true, players = true, playerinfo = true,
+    diag = true, cmdline = true, probe = true,
+    speed = true, settings = true, kick = true, admin = true,
+}
+local SECRET_ARG_COMMANDS = {
+    register = true, login = true, changepass = true, account = true, setupkey = true,
+}
+
 local function sanitize(text)
     if type(text) ~= "string" or text:sub(1, 1) ~= "/" then return text end
     local parts = {}
     for p in text:sub(2):gmatch("%S+") do parts[#parts + 1] = p end
     if #parts == 0 then return text end
     local cmd = parts[1]:lower()
-    if cmd == "register" then
-        if #parts >= 4 then return "/register *** *** " .. table.concat(parts, " ", 4)
-        elseif #parts >= 3 then return "/register *** ***"
-        else return "/register ***" end
-    elseif cmd == "login" then
-        return "/login ***"
-    elseif cmd == "changepass" then
-        return "/changepass *** ***"
+    local argc = #parts - 1
+    if argc == 0 then return "/" .. parts[1] end
+    if SAFE_ARGS_COMMANDS[cmd] then return text end
+    if SECRET_ARG_COMMANDS[cmd] then
+        return "/" .. parts[1] .. " (" .. argc .. " args hidden)"
     end
-    return text
+    -- 未知/拼错的命令：绝不记录参数（很可能是打错的 register/login）
+    return "/" .. parts[1] .. " (" .. argc .. " args hidden, unknown command)"
 end
 
 ---------------------------------------------------------------------------

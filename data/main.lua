@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.10.0"
+local version = "1.10.1"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
