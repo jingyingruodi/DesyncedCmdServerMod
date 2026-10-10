@@ -81,8 +81,24 @@ srv_print("CmdServerMod", "Data Layer Booting v" .. version)
 ---------------------------------------------------------------------------
 -- Map.GetSave() 无参时，对「不含当前 scenario 的 mod」返回本 mod 的专属子表
 -- parent.mods[mod_id]，因此直接用它的字段即可，不必再套一层。
+-- ★ 存档表引用缓存。
+--
+-- 为什么需要：`Map.GetSave()` 返回的是「**当前执行上下文所属模组**的子表」。
+-- 从 lrdb 调试器（后台控制台）里调用模组函数时，并没有「当前模组包」这个上下文，
+-- 于是拿到的是**另一张表** —— 在那里读写都不会影响真正的存档状态。
+-- 实测表现：`/whoami` 会把控制台身份认成 guest，`console_set_setupkey` 写的键
+-- 模组自己也读不到（2026-10-07）。
+--
+-- 所以：只要在**真实上下文**（OnTick / 玩家动作）里成功拿到过一次，就把它缓存下来，
+-- 之后一律复用这个引用。控制台路径因此能操作到正确的表。
+local _save_ref = nil
+
 local function get_ms()
-    local save = Map.GetSave()
+    local save = _save_ref
+    if type(save) ~= "table" then
+        save = Map.GetSave()
+        if type(save) == "table" then _save_ref = save end
+    end
     -- 一次性迁移：v1.8.0 曾写到 save.CmdServerMod.*
     if type(save.CmdServerMod) == "table" then
         local old = save.CmdServerMod
@@ -111,6 +127,16 @@ local RANK_LEVEL = { guest = 0, player = 1, admin = 2, superadmin = 3 }
 -- 定义必须早于 execute_command，因为后者要据此跳过 ensure_session。
 local CONSOLE_ID = -1000
 local CONSOLE_NAME = "__console__"
+
+-- 供控制台判断「存档引用是否来自真实上下文」
+local function save_ref_ready() return type(_save_ref) == "table" end
+local function mark_save_ref()
+    if type(_save_ref) ~= "table" then
+        local ok, v = pcall(Map.GetSave)
+        if ok and type(v) == "table" then _save_ref = v end
+    end
+    return save_ref_ready()
+end
 
 local function get_session(p_id)
     if not _G.CmdServerMod._sessions then return nil end
@@ -1238,6 +1264,7 @@ function PlayerAction.CmdServerExec(player_id, faction, arg)
 
     if arg.is_command and _G.CmdServerMod.execute_command then
         _G.CmdServerMod._in_action = true          -- 供 /probe 判断能否 RunUI
+        mark_save_ref()                            -- 真实上下文，固定存档引用
         local ok, result, secret = _G.CmdServerMod.execute_command(text, rpid)
         _G.CmdServerMod._in_action = false
         if ok then
@@ -1306,6 +1333,7 @@ _G.CmdServerMod.console_exec = function(text)
     if type(text) ~= "string" or text:sub(1, 1) ~= "/" then
         return false, "usage: console_exec('/命令 参数')"
     end
+    local ready = mark_save_ref()
     local ok0, err0 = pcall(function()
         ensure_init()
         ensure_console_session()
@@ -1316,6 +1344,12 @@ _G.CmdServerMod.console_exec = function(text)
     local pcall_ok, cmd_ok, result = pcall(_G.CmdServerMod.execute_command, text, CONSOLE_ID)
     if not pcall_ok then return false, "exec failed: " .. tostring(cmd_ok) end
     if not cmd_ok then return false, tostring(result) end
+    if not ready then
+        return true, tostring(result) ..
+            "\n\n⚠️ 警告：本次执行时**还没拿到过真实上下文的存档引用**" ..
+            "（服务器从未 tick 过），读写可能落在错误的表上。" ..
+            "请等有玩家连入（或先跑过一帧）再用后台控制台。"
+    end
     return true, tostring(result)
 end
 
@@ -1435,6 +1469,9 @@ srv_print("CmdServerMod", "Data Layer Ready v" .. version)
 _G.CmdServerMod._known_players = _G.CmdServerMod._known_players or {}
 
 local function on_tick_impl()
+    -- ★ 在**真实仿真上下文**里把存档表引用固定下来（见 _save_ref 的说明）
+    mark_save_ref()
+
     -- 首次 Tick 执行初始化（Map.GetSave 在加载阶段不可用）
     if not _G.CmdServerMod._init_done then
         ensure_init()
