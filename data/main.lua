@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.10.1"
+local version = "1.10.2"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -1469,9 +1469,11 @@ srv_print("CmdServerMod", "Data Layer Ready v" .. version)
 _G.CmdServerMod._known_players = _G.CmdServerMod._known_players or {}
 
 local function on_tick_impl()
-    -- ★ 在**真实仿真上下文**里把存档表引用固定下来（见 _save_ref 的说明）
-    mark_save_ref()
-
+    -- ★ 回归修复：**不要**在这里调 mark_save_ref()！
+    --   -SessionSettings 是 run_without_players=false，**没有玩家时仿真不 tick**，
+    --   所以这段代码要等客户端连入后第一次 tick 才跑；而那一刻 Map.GetSave()
+    --   会触发引擎级 ACCESS_VIOLATION（pcall 拦不住段错误），表现为
+    --   「客户端一连入服务端就崩」。存档引用由 ensure_init() 里的 get_ms() 自然填充即可。
     -- 首次 Tick 执行初始化（Map.GetSave 在加载阶段不可用）
     if not _G.CmdServerMod._init_done then
         ensure_init()
