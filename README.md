@@ -175,6 +175,36 @@ Simulation 层的 `print()` 会同步到**所有在线客户端的调试日志**
 
 ---
 
+## ⚠️ version_code 与模组同步（改代码前必读）
+
+Desynced 的专用服务器会**把自己的模组同步给连入的客户端** —— 客户端即使一个模组
+都没装也能进服，因为服务器会把 mod 上传给它。
+
+判断「要不要重新上传」的唯一依据是 `def.json` 里的 **`version_code`**：
+
+| 情形 | 引擎行为 |
+| :--- | :--- |
+| `version_code` 与客户端已有的不同 | 服务器把自己的 mod 上传给客户端 |
+| 客户端根本没有这个 mod | 同样由服务器上传 |
+| **`version_code` 相同、但实际代码不同** | 客户端报「**运行代码不一致**」，并把玩家**卡回主菜单**（进不去游戏） |
+
+Lua 没有编译器指纹，引擎只能信 `version_code`。因此：
+
+> ### 🔴 任何对 `data/` 或 `ui/` 的改动，都必须同时提升 `def.json` 的 `version_code`（建议 `version_name` 一起改）。
+> 否则已经持有同号版本的玩家会被踢回主菜单。
+
+仓库提供了一个 `pre-commit` 钩子自动拦截这种提交：
+
+```sh
+cp tools/pre-commit-version-code.sh .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+```
+
+（`tools/` 属于开发工作区，不在模组仓库内；如果你只在模组仓库里工作，
+把该脚本内容直接放进 `.git/hooks/pre-commit` 即可。`tools/check.sh` 里还有一条
+历史审计，会列出所有「改了代码却没升版本号」的提交。）
+
+---
+
 ## Project structure
 
 - `data/main.lua` — core logic (Simulation layer)
