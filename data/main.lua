@@ -16,7 +16,7 @@
 
 local package = ...
 _G.CmdServerMod = _G.CmdServerMod or {}
-local version = "1.10.2"
+local version = "1.10.3"
 local tick_counter = 0
 
 ---------------------------------------------------------------------------
@@ -474,14 +474,39 @@ local function ensure_init()
                 srv_print("SYSTEM", "Setup key loaded from GameSettings (CmdServerMod_setupkey). It is never printed.")
             else
                 ms.setup_key = random_str(12)
-                -- ⚠️ 下面这一行会同步到所有客户端调试日志。这是 bootstrap 的固有代价：
-                -- 在拿到第一个超管之前，运维必须能看到 key。拿到后请勿再用 /setupkey show，
-                -- 或直接用 -SetupKey= 启动以免出现这一行。
+                -- ★★ 安全修复（2026-10-19，v1.10.3）：**密钥绝不能广播给客户端**。
+                --
+                -- 背景：srv_print() → print()，而 Simulation 层的 print 会被引擎
+                -- **镜像到所有客户端的调试控制台**。实测（隔离 display + -log 抓客户端
+                -- 控制台）确认：客户端能看到 `[SYSTEM] INITIAL SETUP KEY: <明文>`。
+                --
+                -- 危害：在运维用密钥注册超管之前，**第一个连入的玩家就能在自己的控制台
+                -- 看到它并抢先注册成超管**。而 run_without_players=false 意味着
+                -- 「有人连入」恰恰就是「第一次 tick、第一次执行 ensure_init」的时刻 ——
+                -- 也就是说旧代码几乎**总是在有人在线时**打印密钥。
+                --
+                -- 现在的策略（失败关闭）：**有任何玩家在线就绝不打印明文**，只给提示。
+                -- 运维获取密钥的正道：
+                --   a) 启动参数 -GameSettings "... 'CmdServerMod_setupkey': '<key>' ..."
+                --      （推荐；此时根本不生成随机密钥，也不打印）
+                --   b) 服务器后台 tools/console.sh --raw 'return
+                --      CmdServerMod.console_get_setupkey()'（需 ENABLE_LUA_DEBUGGER）
+                local n_players, players = 0, nil
+                pcall(function() players = Game.GetAllPlayers() end)
+                if type(players) == "table" then n_players = #players end
+
                 srv_print("SYSTEM", "========================================================")
                 if not _G.CmdServerMod._setupkey_from_console then
-                    srv_print("SYSTEM", "INITIAL SETUP KEY: " .. ms.setup_key)
+                    if n_players == 0 then
+                        -- 没有任何客户端在线 → 这行不会被任何玩家看到，可以安全打印
+                        srv_print("SYSTEM", "INITIAL SETUP KEY: " .. ms.setup_key)
+                    else
+                        srv_print("SYSTEM", "INITIAL SETUP KEY: [已隐藏 —— 有玩家在线时绝不打印明文]")
+                        srv_print("SYSTEM", "  取回方式：重启时用 -GameSettings \"'CmdServerMod_setupkey': '<key>'\"")
+                        srv_print("SYSTEM", "  或在服务器后台执行 console.sh --raw 'return CmdServerMod.console_get_setupkey()'")
+                    end
                 end
-                srv_print("SYSTEM", "Register immediately, or restart with -SetupKey=<key> to avoid printing.")
+                srv_print("SYSTEM", "Register immediately, or restart with a GameSettings setup key to avoid this.")
                 srv_print("SYSTEM", "========================================================")
             end
         else
