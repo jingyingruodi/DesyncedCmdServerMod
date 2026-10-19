@@ -491,20 +491,25 @@ local function ensure_init()
                 --      （推荐；此时根本不生成随机密钥，也不打印）
                 --   b) 服务器后台 tools/console.sh --raw 'return
                 --      CmdServerMod.console_get_setupkey()'（需 ENABLE_LUA_DEBUGGER）
-                local n_players, players = 0, nil
-                pcall(function() players = Game.GetAllPlayers() end)
-                if type(players) == "table" then n_players = #players end
-
+                -- ★★ 确定性地**永不明文打印**。
+                --
+                -- 曾经尝试「数一下在线玩家，没人才打印」，但真机上不可靠：
+                -- 实测日志顺序是 `Sending map state` → `INITIAL SETUP KEY` → `[JOIN]`，
+                -- 即首次 tick 执行 ensure_init 时，**正在连入的那个玩家还没进入
+                -- Game.GetAllPlayers()**。于是「没人在线」的判断在真实引擎里形同虚设，
+                -- 明文密钥照样被广播出去（这个竞态是 mock 测试发现不了的）。
+                --
+                -- 结论：只要 print() 会镜像到客户端，就不存在「安全打印」的时机。
+                -- 因此这里只打占位，密钥一律通过下列方式取回：
+                --   a) 启动参数 -GameSettings "... 'CmdServerMod_setupkey': '<key>' ..."（推荐）
+                --   b) 服务器后台 console.sh --raw 'return CmdServerMod.console_get_setupkey()'
+                --   c) 直接读存档里的 setup_key 字段
                 srv_print("SYSTEM", "========================================================")
                 if not _G.CmdServerMod._setupkey_from_console then
-                    if n_players == 0 then
-                        -- 没有任何客户端在线 → 这行不会被任何玩家看到，可以安全打印
-                        srv_print("SYSTEM", "INITIAL SETUP KEY: " .. ms.setup_key)
-                    else
-                        srv_print("SYSTEM", "INITIAL SETUP KEY: [已隐藏 —— 有玩家在线时绝不打印明文]")
-                        srv_print("SYSTEM", "  取回方式：重启时用 -GameSettings \"'CmdServerMod_setupkey': '<key>'\"")
-                        srv_print("SYSTEM", "  或在服务器后台执行 console.sh --raw 'return CmdServerMod.console_get_setupkey()'")
-                    end
+                    srv_print("SYSTEM", "INITIAL SETUP KEY: [已隐藏 —— 绝不明文打印，因为 print 会广播给所有客户端]")
+                    srv_print("SYSTEM", "  取回方式：a) 启动参数 -GameSettings \"'CmdServerMod_setupkey': '<key>'\"（推荐）")
+                    srv_print("SYSTEM", "            b) 后台 console.sh --raw 'return CmdServerMod.console_get_setupkey()'")
+                    srv_print("SYSTEM", "            c) 直接读存档的 setup_key 字段")
                 end
                 srv_print("SYSTEM", "Register immediately, or restart with a GameSettings setup key to avoid this.")
                 srv_print("SYSTEM", "========================================================")
